@@ -1,7 +1,7 @@
 # Developing Brewski
 
-The original working script is preserved on `main` and at the annotated tag
-`baseline-2026-09-19`. Work on the reliability fixes is on `enhancements`.
+The original working script is preserved at the annotated tag
+`baseline-2026-09-19`. The reliability fixes have been merged into `main`.
 The separate executable in `~/.local/bin/brewski` is not updated by this checkout.
 
 ## Checks
