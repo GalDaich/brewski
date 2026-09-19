@@ -3,19 +3,25 @@
 # brewski - Update, clean, and verify a Homebrew installation.
 
 emulate -LR zsh
-zmodload zsh/system
-zmodload zsh/datetime
+unsetopt bgnice
+for module in zsh/system zsh/datetime; do
+  zmodload "$module" || { print -u2 -r -- "brewski: required module unavailable: $module"; exit 1; }
+done
+VERSION='0.1.0-dev'
 
 SCRIPT_PATH="${0:A}"
 PROGRAM_NAME="${0:t}"
 AUTOREMOVE=false
 GREEDY=false
 NO_QUIT=false
+[[ -n "${HOMEBREW_NO_UPGRADE_QUIT_CASKS:-}" ]] && NO_QUIT=true
 DIAGNOSTICS=false
 NOTIFY_TEST=false
 OVERALL_STATUS=0
+WARNING_COUNT=0
 CHILD_PID=''
 RUNTIME_DIR=''
+CANCEL_INCOMPLETE=false
 STDIN_FD=''
 SCRIPT_START=$EPOCHREALTIME
 
@@ -193,45 +199,61 @@ notify() {
 # ---------------------------------------------------------------------------
 
 restore_tty() {
-  [[ -n "${TTY_SAVED_STTY:-}" && -n "${TTY_FD:-}" ]] \
-    && command stty "$TTY_SAVED_STTY" <&$TTY_FD 2>/dev/null
-  return 0
+  [[ -z "${TTY_SAVED_STTY:-}" || -z "${TTY_FD:-}" ]] && return 0
+  command stty "$TTY_SAVED_STTY" <&$TTY_FD 2>/dev/null
+}
+
+close_password_tty() {
+  local rc=0
+  restore_tty || rc=1
+  [[ -n "${TTY_FD:-}" ]] && exec {TTY_FD}>&-
+  TTY_FD=''
+  TTY_SAVED_STTY=''
+  return $rc
 }
 
 read_tty_password() {
   local prompt="$1" context="$2" pw rc
-  exec {TTY_FD}<>/dev/tty || return 1
+  # This function runs only in the dedicated askpass-helper process.
+  if ! { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then
+    print -u2 -r -- "${PROGRAM_NAME}: no terminal is available for administrator authentication."
+    return 1
+  fi
+  TTY_SAVED_STTY=''
+  trap close_password_tty EXIT
+  trap 'close_password_tty; exit 130' INT
+  trap 'close_password_tty; exit 143' TERM
+  trap 'close_password_tty; exit 129' HUP
+
+  # Never prompt for a password until echo has been successfully disabled.
+  if ! TTY_SAVED_STTY="$(command stty -g <&$TTY_FD 2>/dev/null)" \
+      || [[ -z "$TTY_SAVED_STTY" ]] \
+      || ! command stty -echo <&$TTY_FD 2>/dev/null; then
+    print -u2 -r -- "${PROGRAM_NAME}: could not disable terminal echo; refusing to read a password."
+    return 1
+  fi
   {
     print -r -- ""
     print -r -- "🔐 ${PROGRAM_NAME}: administrator access required for ${context}."
     print -rn -- "${prompt} "
-  } >&$TTY_FD || { exec {TTY_FD}>&-; return 1; }
-
-  # `read -s` does NOT suppress echo when reading from an explicit fd rather
-  # than stdin -- verified: it echoes the password to the screen. Drive termios
-  # directly instead, and restore it even if the prompt is interrupted, so a
-  # Ctrl-C here can never leave the terminal with echo disabled.
-  TTY_SAVED_STTY="$(command stty -g <&$TTY_FD 2>/dev/null)"
-  trap restore_tty EXIT INT TERM HUP
-  command stty -echo <&$TTY_FD 2>/dev/null
+  } >&$TTY_FD || return 1
 
   IFS= read -r pw <&$TTY_FD
   rc=$?
-
-  restore_tty
   print -r -- "" >&$TTY_FD
-  exec {TTY_FD}>&-
-
+  if ! close_password_tty; then
+    print -u2 -r -- "${PROGRAM_NAME}: could not restore terminal settings; run 'stty sane'."
+    return 1
+  fi
   (( rc == 0 )) || return 1
   print -r -- "$pw"
-  return 0
 }
 
 askpass_main() {
   local prompt="${1:-Password:}"
   local context="${BREWSKI_TASK:-Homebrew}"
   local stamp="${BREWSKI_RUNTIME_DIR:-${TMPDIR:-/tmp}}/last-sudo-notify"
-  local now=$EPOCHSECONDS last=0 pw
+  local now=$EPOCHSECONDS last=0
 
   # sudo re-invokes the helper on a mistyped password; don't stack alerts.
   [[ -r "$stamp" ]] && IFS= read -r last < "$stamp" 2>/dev/null
@@ -244,13 +266,12 @@ askpass_main() {
 
   # Probe by opening, not with -r/-w: see notify_tty. Getting this wrong makes
   # the headless path fall through and hand sudo an empty password.
-  if pw="$(read_tty_password "$prompt" "$context" 2>/dev/null)"; then
-    print -r -- "$pw"
+  if read_tty_password "$prompt" "$context"; then
     return 0
   fi
 
   print -u2 -r -- "${PROGRAM_NAME}: administrator password required for ${context}," \
-                  "but no terminal is available; aborting instead of hanging."
+                  "but secure password input failed; aborting."
   return 1
 }
 
@@ -279,14 +300,16 @@ Options:
                  marked auto_updates are upgraded in every mode.
 
   --no-quit      Do not quit running cask applications during an upgrade.
-                 Useful when you are actively using an app that is due an
-                 update; the upgrade applies on next launch instead.
+                 Also respects HOMEBREW_NO_UPGRADE_QUIT_CASKS. This does not
+                 defer installation; app behavior during replacement varies.
 
   --diagnostics  Print 'brew config' at the start of the run. Off by default
                  because it is only useful when filing a Homebrew bug report.
 
   --notify-test  Send a test desktop notification and exit, to confirm alerts
                  reach you on this machine and terminal. Changes nothing.
+
+  --version     Show the version and exit.
 
   -h, --help     Show this help and exit without changing anything.
 
@@ -301,13 +324,14 @@ Homebrew formula and cask upgrade plans are approved automatically.
 Normal cleanup is performed in every mode; aggressive cache pruning is not.
 
 Some casks need administrator rights to install. When that happens brewski
-posts a desktop notification from the terminal app it is running in and then
-prompts on the terminal. With no terminal attached (cron, launchd) it notifies
-and aborts rather than blocking forever on an invisible prompt.
+attempts a desktop notification and then prompts on the terminal. With no
+terminal attached (cron, launchd), it attempts a notification and aborts
+rather than blocking forever on an invisible prompt.
 
-Exit status is 0 when every step succeeded, 1 when a step failed, and 2 for a
-usage error. Advisory steps (diagnostics, reports, vulnerability scan) can only
-warn; they never fail the run.
+Exit status is 0 when required steps succeeded, 1 when a required step failed,
+and 2 for a usage error. Advisory steps (diagnostics, reports, vulnerability
+scan) can only warn; they never fail the run. Signals return 128 plus the
+signal number.
 EOF
 }
 
@@ -331,6 +355,7 @@ show_command() {
 }
 
 record_result() {
+  [[ "$2" == warning ]] && (( WARNING_COUNT += 1 ))
   SUMMARY_LABELS+=("$1")
   SUMMARY_STATES+=("$2")
   SUMMARY_TIMES+=("$3")
@@ -365,7 +390,11 @@ run_task() {
   # upgrade finished. Waiting keeps the handler responsive and lets it signal
   # the child. stdin is restored explicitly because zsh points an async job's
   # stdin at /dev/null.
-  BREWSKI_TASK="$label" "$@" <&$STDIN_FD &
+  if [[ "$failure_kind" == verification ]]; then
+    BREWSKI_TASK="$label" "$@" <&$STDIN_FD >"$RUNTIME_DIR/outdated" &
+  else
+    BREWSKI_TASK="$label" "$@" <&$STDIN_FD &
+  fi
   CHILD_PID=$!
   wait "$CHILD_PID"
   local command_status=$?
@@ -373,6 +402,19 @@ run_task() {
 
   local elapsed
   elapsed="$(printf '%.1f' $(( EPOCHREALTIME - start )))"
+
+  if [[ "$failure_kind" == verification ]]; then
+    command cat "$RUNTIME_DIR/outdated"
+    if (( command_status != 0 )) || [[ -s "$RUNTIME_DIR/outdated" ]]; then
+      if (( command_status != 0 )); then
+        print -u2 -r -- "${E_YELLOW}⚠️  Could not verify remaining updates (status ${command_status}).${E_RESET}"
+      else
+        print -u2 -r -- "${E_YELLOW}⚠️  Updates remain; these may include intentionally pinned packages.${E_RESET}"
+      fi
+      record_result "$label" "warning" "$elapsed"
+      return $command_status
+    fi
+  fi
 
   if (( command_status == 0 )); then
     print -r -- "${GREEN}✅ ${label} completed${RESET} ${DIM}(${elapsed}s)${RESET}"
@@ -418,7 +460,10 @@ print_summary() {
   local total
   total="$(printf '%.1f' $(( EPOCHREALTIME - SCRIPT_START )))"
 
-  if (( OVERALL_STATUS == 0 )); then
+  if (( OVERALL_STATUS == 0 && WARNING_COUNT > 0 )); then
+    print -r -- ""
+    print -r -- "${YELLOW}${BOLD}🍻 Brewski completed with ${WARNING_COUNT} warning(s)${RESET} ${DIM}in ${total}s.${RESET}"
+  elif (( OVERALL_STATUS == 0 )); then
     print -r -- ""
     print -r -- "${GREEN}${BOLD}🍻 Brewski finished successfully${RESET} ${DIM}in ${total}s.${RESET}"
   else
@@ -428,17 +473,69 @@ print_summary() {
 }
 
 cleanup() {
+  if [[ "$CANCEL_INCOMPLETE" == true && -n "$RUNTIME_DIR" ]]; then
+    print -u2 -r -- "${PROGRAM_NAME}: some subprocesses could not be stopped; runtime files retained at ${RUNTIME_DIR}."
+    return 0
+  fi
   [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]] && command rm -rf -- "$RUNTIME_DIR" 2>/dev/null
   return 0
 }
 
+# Stop parents before discovering their children so ordinary subprocesses cannot
+# spawn more work during cancellation. Use individual PIDs: the caller's shell
+# may share our process group, and must never receive our termination signals.
+stop_tree() {
+  local parent="$1" child
+  if command kill -STOP "$parent" 2>/dev/null; then
+    CANCEL_PIDS+=("$parent")
+  elif [[ -n "$(command ps -p "$parent" -o pid= 2>/dev/null)" ]]; then
+    # Privileged installers may be visible but not signalable by this user.
+    CANCEL_INCOMPLETE=true
+  fi
+  local children query_rc
+  children="$(command pgrep -P "$parent" 2>/dev/null)"
+  query_rc=$?
+  (( query_rc > 1 )) && CANCEL_INCOMPLETE=true
+  for child in ${(f)children}; do
+    [[ "$child" == <-> ]] && stop_tree "$child"
+  done
+}
+
 handle_interrupt() {
-  local signal="$1"
-  [[ -n "$CHILD_PID" ]] && command kill -TERM "$CHILD_PID" 2>/dev/null
+  local signal="$1" exit_code=130 pid round
+  trap '' INT TERM HUP
+  case "$signal" in
+    TERM) exit_code=143 ;;
+    HUP) exit_code=129 ;;
+  esac
+  if [[ -n "$CHILD_PID" ]]; then
+    typeset -a CANCEL_PIDS=()
+    stop_tree "$CHILD_PID"
+    # Resume stopped processes so they can execute their TERM/EXIT handlers.
+    for pid in "${(@Oa)CANCEL_PIDS}"; do
+      command kill -TERM "$pid" 2>/dev/null
+      command kill -CONT "$pid" 2>/dev/null
+    done
+    for round in {1..30}; do
+      local -a alive=()
+      for pid in "${CANCEL_PIDS[@]}"; do
+        command kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+      done
+      (( ${#alive} == 0 )) && break
+      command sleep 0.1
+    done
+    for pid in "${alive[@]}"; do
+      if ! command kill -KILL "$pid" 2>/dev/null \
+          && [[ -n "$(command ps -p "$pid" -o pid= 2>/dev/null)" ]]; then
+        CANCEL_INCOMPLETE=true
+      fi
+    done
+    wait "$CHILD_PID" 2>/dev/null
+    CHILD_PID=''
+  fi
   print -u2 -r -- ""
   print -u2 -r -- "${E_YELLOW}🛑 Brewski interrupted (SIG${signal}).${E_RESET}"
-  cleanup
-  exit 130
+  exit "$exit_code"
 }
 
 while (( $# )); do
@@ -457,6 +554,10 @@ while (( $# )); do
       ;;
     --notify-test)
       NOTIFY_TEST=true
+      ;;
+    --version)
+      print -r -- "brewski $VERSION"
+      exit 0
       ;;
     -h|--help)
       usage
@@ -487,7 +588,7 @@ if [[ "$NOTIFY_TEST" == true ]]; then
   print -r -- "Protocol: $(notify_protocol)"
   if notify "🍺 brewski test" \
             "Notifications work. A password request will look like this."; then
-    print -r -- "${GREEN}✅ Notification sent.${RESET}"
+    print -r -- "${GREEN}✅ Notification request sent (display is not guaranteed).${RESET}"
     print -r -- "${DIM}   Nothing shown? Allow notifications for your terminal app in${RESET}"
     print -r -- "${DIM}   System Settings > Notifications.${RESET}"
     exit 0
@@ -505,21 +606,36 @@ BREW="$(command -v brew 2>/dev/null)"
 # about those same variables are just noise here.
 export HOMEBREW_NO_ENV_HINTS=1
 
-# flock is atomic and released by the kernel on exit, including SIGKILL, so
-# there is no stale-lock heuristic to race against.
-LOCK_FILE="${TMPDIR:-/tmp}/brewski-${EUID}.lock"
-: >>"$LOCK_FILE" 2>/dev/null || die "could not create the run lock at ${LOCK_FILE}."
+# A persistent per-user location keeps terminal and scheduled invocations on
+# the same lock even when TMPDIR differs. Never unlink a live lock file.
+LOCK_DIR="${HOME}/Library/Caches/brewski"
+if [[ ! -d "$LOCK_DIR" ]]; then
+  (umask 077; command mkdir -p -- "$LOCK_DIR") || die "could not create ${LOCK_DIR}."
+fi
+[[ ! -L "$LOCK_DIR" && -O "$LOCK_DIR" ]] || die "lock directory must be owned by you and not a symlink."
+command chmod 700 "$LOCK_DIR" || die "could not secure the lock directory."
+LOCK_FILE="${LOCK_DIR}/run.lock"
+[[ ! -L "$LOCK_FILE" ]] || die "lock file must not be a symlink."
+(umask 077; : >>"$LOCK_FILE") || die "could not create the run lock."
 zsystem flock -f LOCK_FD -t 0 "$LOCK_FILE" 2>/dev/null \
-  || die "another brewski process is already running."
+  || die "could not acquire the run lock; another brewski process may be running."
 
+trap cleanup EXIT
+trap 'handle_interrupt INT' INT
+trap 'handle_interrupt TERM' TERM
+trap 'handle_interrupt HUP' HUP
 RUNTIME_DIR="$(command mktemp -d "${TMPDIR:-/tmp}/brewski-run.XXXXXX")" \
   || die "could not create a runtime directory."
 export BREWSKI_RUNTIME_DIR="$RUNTIME_DIR"
 
+# The installed version can disappear during a Homebrew self-upgrade. Retain
+# a private snapshot for every subsequent administrator-password request.
+command cp -- "$SCRIPT_PATH" "$RUNTIME_DIR/brewski" || die "could not snapshot the password helper."
+command chmod 700 "$RUNTIME_DIR/brewski" || die "could not secure the password helper snapshot."
 ASKPASS_HELPER="${RUNTIME_DIR}/askpass"
 {
   print -r -- '#!/bin/zsh'
-  print -r -- "exec ${(q)SCRIPT_PATH} --askpass-helper \"\$@\""
+  print -r -- "exec ${(q)RUNTIME_DIR}/brewski --askpass-helper \"\$@\""
 } > "$ASKPASS_HELPER" || die "could not write the askpass helper."
 command chmod 700 "$ASKPASS_HELPER" || die "could not prepare the askpass helper."
 export SUDO_ASKPASS="$ASKPASS_HELPER"
@@ -532,11 +648,6 @@ dup_stdin() { exec {STDIN_FD}<&0; }
 if ! dup_stdin 2>/dev/null; then
   exec {STDIN_FD}</dev/null
 fi
-
-trap cleanup EXIT
-trap 'handle_interrupt INT' INT
-trap 'handle_interrupt TERM' TERM
-trap 'handle_interrupt HUP' HUP
 
 print -r -- "${BOLD}🍺 Brewski — Homebrew maintenance${RESET}"
 print -r -- "${DIM}${RULE}${RESET}"
@@ -604,7 +715,7 @@ run_task "🛡️" "Formula vulnerability scan" "warning" \
   "$BREW" vulns --fix-available --list-skipped --max-summary=0
 
 outdated_command
-run_task "✅" "Final outdated-package check" "warning" "${reply[@]}"
+run_task "✅" "Final outdated-package check" "verification" "${reply[@]}"
 
 print_summary
 exit "$OVERALL_STATUS"
