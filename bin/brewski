@@ -1,0 +1,610 @@
+#!/bin/zsh
+
+# brewski - Update, clean, and verify a Homebrew installation.
+
+emulate -LR zsh
+zmodload zsh/system
+zmodload zsh/datetime
+
+SCRIPT_PATH="${0:A}"
+PROGRAM_NAME="${0:t}"
+AUTOREMOVE=false
+GREEDY=false
+NO_QUIT=false
+DIAGNOSTICS=false
+NOTIFY_TEST=false
+OVERALL_STATUS=0
+CHILD_PID=''
+RUNTIME_DIR=''
+STDIN_FD=''
+SCRIPT_START=$EPOCHREALTIME
+
+typeset -a SUMMARY_LABELS
+typeset -a SUMMARY_STATES
+typeset -a SUMMARY_TIMES
+
+ESC=$'\e'
+BEL=$'\a'
+ST=$'\e\\'
+
+# Two palettes: stdout messages honour a stdout TTY, stderr messages honour a
+# stderr TTY. Using one check for both leaks escape codes into redirected logs.
+set_palette() {
+  local prefix="$1" fd="$2"
+  if [[ -z "${NO_COLOR:-}" ]] && [[ -t "$fd" ]]; then
+    typeset -g "${prefix}RED"=$'\e[31m'
+    typeset -g "${prefix}GREEN"=$'\e[32m'
+    typeset -g "${prefix}YELLOW"=$'\e[33m'
+    typeset -g "${prefix}BLUE"=$'\e[34m'
+    typeset -g "${prefix}BOLD"=$'\e[1m'
+    typeset -g "${prefix}DIM"=$'\e[2m'
+    typeset -g "${prefix}RESET"=$'\e[0m'
+  else
+    typeset -g "${prefix}RED"=''
+    typeset -g "${prefix}GREEN"=''
+    typeset -g "${prefix}YELLOW"=''
+    typeset -g "${prefix}BLUE"=''
+    typeset -g "${prefix}BOLD"=''
+    typeset -g "${prefix}DIM"=''
+    typeset -g "${prefix}RESET"=''
+  fi
+}
+set_palette '' 1
+set_palette 'E_' 2
+
+integer RULE_WIDTH=${COLUMNS:-0}
+if (( RULE_WIDTH <= 0 )); then
+  RULE_WIDTH=$(command tput cols 2>/dev/null || print -r -- 0)
+fi
+(( RULE_WIDTH >= 20 )) || RULE_WIDTH=52
+(( RULE_WIDTH <= 100 )) || RULE_WIDTH=100
+RULE="${(l:RULE_WIDTH::━:):-}"
+
+# ---------------------------------------------------------------------------
+# Desktop notifications
+#
+# Delivered by the terminal emulator itself via an OSC escape sequence, so the
+# alert is posted by whichever app is hosting the script (Ghostty, iTerm2,
+# Terminal.app, kitty, WezTerm, ...) with that app's own name and icon. No
+# helper binary and no bundle-identifier spoofing required.
+# ---------------------------------------------------------------------------
+
+notify_protocol() {
+  if [[ -n "${KITTY_WINDOW_ID:-}" || "${TERM:-}" == *kitty* ]]; then
+    print -r -- kitty
+  elif [[ -n "${WEZTERM_PANE:-}" || -n "${GHOSTTY_RESOURCES_DIR:-}" \
+        || "${TERM_PROGRAM:-}" == (ghostty|WezTerm) \
+        || "${TERM:-}" == (*ghostty*|rxvt-unicode*|foot*|*rio*) ]]; then
+    print -r -- osc777
+  else
+    print -r -- osc9
+  fi
+}
+
+# Nearest ancestor process that lives inside a .app bundle. Used only for the
+# headless fallback, so the notification is still attributed to the host app.
+terminal_app_bundle_id() {
+  if [[ -n "${TERMINAL_BUNDLE_ID+x}" ]]; then
+    print -r -- "$TERMINAL_BUNDLE_ID"
+    return 0
+  fi
+
+  local id="${__CFBundleIdentifier:-}"
+  if [[ -z "$id" ]]; then
+    local pid=$$ ppid cmd app
+    repeat 12; do
+      ppid="$(command ps -o ppid= -p "$pid" 2>/dev/null | command tr -d ' ')"
+      [[ "$ppid" == <-> ]] && (( ppid > 1 )) || break
+      cmd="$(command ps -o comm= -p "$ppid" 2>/dev/null)"
+      if [[ "$cmd" == *.app/Contents/MacOS/* ]]; then
+        app="${cmd%%.app/Contents/MacOS/*}.app"
+        id="$(command defaults read "${app}/Contents/Info" CFBundleIdentifier 2>/dev/null)"
+        break
+      fi
+      pid="$ppid"
+    done
+  fi
+
+  typeset -g TERMINAL_BUNDLE_ID="$id"
+  print -r -- "$id"
+}
+
+notify_headless() {
+  local title="$1" body="$2" bundle_id
+  local -a sender
+
+  bundle_id="$(terminal_app_bundle_id)"
+  [[ -n "$bundle_id" ]] && sender=(-sender "$bundle_id")
+
+  if (( $+commands[terminal-notifier] )); then
+    command terminal-notifier -title "$title" -message "$body" "${sender[@]}" \
+      >/dev/null 2>&1 && return 0
+  fi
+
+  if (( $+commands[osascript] )); then
+    local t="${title//\\/\\\\}" b="${body//\\/\\\\}"
+    t="${t//\"/\\\"}"
+    b="${b//\"/\\\"}"
+    command osascript -e "display notification \"${b}\" with title \"${t}\"" \
+      >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
+}
+
+notify_tty() {
+  # 'status' is a zsh special parameter aliased to $?; a local of that name is
+  # a fatal read-only error. Any name but that.
+  local payload="$1" fd rc
+  exec {fd}>/dev/tty || return 1
+  print -rn -- "$payload" >&$fd
+  rc=$?
+  exec {fd}>&-
+  return $rc
+}
+
+notify() {
+  local title="$1" body="$2" payload
+
+  # OSC payloads are delimited by ; and terminated by control characters.
+  title="${title//[$'\e'$'\a';]/ }"
+  body="${body//[$'\e'$'\a']/ }"
+
+  case "$(notify_protocol)" in
+    kitty)
+      payload="${ESC}]99;i=brewski:d=0:p=title;${title}${ST}"
+      payload+="${ESC}]99;i=brewski:d=1:p=body;${body}${ST}"
+      ;;
+    osc777)
+      payload="${ESC}]777;notify;${title};${body}${BEL}"
+      ;;
+    *)
+      payload="${ESC}]9;${title}: ${body}${BEL}"
+      ;;
+  esac
+
+  # Multiplexers swallow OSC unless it is wrapped in a DCS passthrough.
+  if [[ -n "${TMUX:-}" ]]; then
+    payload="${ESC}Ptmux;${payload//${ESC}/${ESC}${ESC}}${ST}"
+  elif [[ "${TERM:-}" == screen* ]]; then
+    payload="${ESC}P${payload}${ST}"
+  fi
+
+  # /dev/tty must be probed by opening it: the device node is mode crw-rw-rw-,
+  # so -r/-w succeed even when there is no controlling terminal and the open
+  # fails with ENXIO. Redirecting the helper's stderr also swallows zsh's
+  # redirection-failure message, which 2>/dev/null on the redirect itself
+  # cannot do.
+  if notify_tty "$payload" 2>/dev/null; then
+    return 0
+  fi
+
+  notify_headless "$title" "$body"
+}
+
+# ---------------------------------------------------------------------------
+# sudo askpass helper
+#
+# Homebrew passes `-A` to sudo(8) whenever $SUDO_ASKPASS is set
+# (Library/Homebrew/system_command.rb), so sudo delegates the prompt to this
+# helper instead of reading the TTY directly. That gives an exact signal for
+# "a cask is asking for an administrator password" -- no polling, no guessing --
+# and lets an unattended run fail fast instead of blocking forever.
+# ---------------------------------------------------------------------------
+
+restore_tty() {
+  [[ -n "${TTY_SAVED_STTY:-}" && -n "${TTY_FD:-}" ]] \
+    && command stty "$TTY_SAVED_STTY" <&$TTY_FD 2>/dev/null
+  return 0
+}
+
+read_tty_password() {
+  local prompt="$1" context="$2" pw rc
+  exec {TTY_FD}<>/dev/tty || return 1
+  {
+    print -r -- ""
+    print -r -- "🔐 ${PROGRAM_NAME}: administrator access required for ${context}."
+    print -rn -- "${prompt} "
+  } >&$TTY_FD || { exec {TTY_FD}>&-; return 1; }
+
+  # `read -s` does NOT suppress echo when reading from an explicit fd rather
+  # than stdin -- verified: it echoes the password to the screen. Drive termios
+  # directly instead, and restore it even if the prompt is interrupted, so a
+  # Ctrl-C here can never leave the terminal with echo disabled.
+  TTY_SAVED_STTY="$(command stty -g <&$TTY_FD 2>/dev/null)"
+  trap restore_tty EXIT INT TERM HUP
+  command stty -echo <&$TTY_FD 2>/dev/null
+
+  IFS= read -r pw <&$TTY_FD
+  rc=$?
+
+  restore_tty
+  print -r -- "" >&$TTY_FD
+  exec {TTY_FD}>&-
+
+  (( rc == 0 )) || return 1
+  print -r -- "$pw"
+  return 0
+}
+
+askpass_main() {
+  local prompt="${1:-Password:}"
+  local context="${BREWSKI_TASK:-Homebrew}"
+  local stamp="${BREWSKI_RUNTIME_DIR:-${TMPDIR:-/tmp}}/last-sudo-notify"
+  local now=$EPOCHSECONDS last=0 pw
+
+  # sudo re-invokes the helper on a mistyped password; don't stack alerts.
+  [[ -r "$stamp" ]] && IFS= read -r last < "$stamp" 2>/dev/null
+  [[ "$last" == <-> ]] || last=0
+  if (( now - last > 30 )); then
+    notify "🔐 brewski needs your password" \
+           "${context}: an installer is requesting administrator access."
+    print -r -- "$now" > "$stamp" 2>/dev/null
+  fi
+
+  # Probe by opening, not with -r/-w: see notify_tty. Getting this wrong makes
+  # the headless path fall through and hand sudo an empty password.
+  if pw="$(read_tty_password "$prompt" "$context" 2>/dev/null)"; then
+    print -r -- "$pw"
+    return 0
+  fi
+
+  print -u2 -r -- "${PROGRAM_NAME}: administrator password required for ${context}," \
+                  "but no terminal is available; aborting instead of hanging."
+  return 1
+}
+
+if [[ "${1:-}" == "--askpass-helper" ]]; then
+  shift
+  askpass_main "$@"
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Usage:
+  ${PROGRAM_NAME} [OPTIONS]
+
+Update, clean, and verify your Homebrew installation.
+
+Options:
+  --autoremove   Remove formulae installed only as dependencies that Homebrew
+                 considers no longer needed. Without this option, brewski only
+                 previews them. Preview is the default because autoremove still
+                 misjudges formulae that are required by casks.
+
+  --greedy       Also include casks with version :latest. Versioned casks
+                 marked auto_updates are upgraded in every mode.
+
+  --no-quit      Do not quit running cask applications during an upgrade.
+                 Useful when you are actively using an app that is due an
+                 update; the upgrade applies on next launch instead.
+
+  --diagnostics  Print 'brew config' at the start of the run. Off by default
+                 because it is only useful when filing a Homebrew bug report.
+
+  --notify-test  Send a test desktop notification and exit, to confirm alerts
+                 reach you on this machine and terminal. Changes nothing.
+
+  -h, --help     Show this help and exit without changing anything.
+
+Examples:
+  ${PROGRAM_NAME}
+  ${PROGRAM_NAME} --autoremove
+  ${PROGRAM_NAME} --greedy --no-quit
+  ${PROGRAM_NAME} --autoremove --greedy
+
+Options may appear in any order, may be combined, and may be repeated.
+Homebrew formula and cask upgrade plans are approved automatically.
+Normal cleanup is performed in every mode; aggressive cache pruning is not.
+
+Some casks need administrator rights to install. When that happens brewski
+posts a desktop notification from the terminal app it is running in and then
+prompts on the terminal. With no terminal attached (cron, launchd) it notifies
+and aborts rather than blocking forever on an invisible prompt.
+
+Exit status is 0 when every step succeeded, 1 when a step failed, and 2 for a
+usage error. Advisory steps (diagnostics, reports, vulnerability scan) can only
+warn; they never fail the run.
+EOF
+}
+
+die() {
+  print -u2 -r -- "${E_RED}❌ ${PROGRAM_NAME}: $*${E_RESET}"
+  exit 1
+}
+
+section() {
+  local icon="$1"
+  shift
+  print -r -- ""
+  print -r -- "${BLUE}${BOLD}${icon} $*${RESET}"
+  print -r -- "${DIM}${RULE}${RESET}"
+}
+
+show_command() {
+  local -a quoted
+  quoted=("${(@q)@}")
+  print -r -- "${DIM}  \$ ${quoted[*]}${RESET}"
+}
+
+record_result() {
+  SUMMARY_LABELS+=("$1")
+  SUMMARY_STATES+=("$2")
+  SUMMARY_TIMES+=("$3")
+}
+
+# Builds the outdated invocation into $reply. Both the pre-flight report and
+# the final verification must stay identical for the comparison to mean
+# anything, so they share one definition.
+outdated_command() {
+  reply=(env -u HOMEBREW_UPGRADE_GREEDY -u HOMEBREW_UPGRADE_GREEDY_CASKS
+         "$BREW" outdated --verbose)
+  if [[ "$GREEDY" == true ]]; then
+    reply+=(--greedy)
+  else
+    reply+=(--greedy-auto-updates)
+  fi
+}
+
+run_task() {
+  local icon="$1"
+  local label="$2"
+  local failure_kind="$3"
+  shift 3
+
+  section "$icon" "$label"
+  show_command "$@"
+
+  local start=$EPOCHREALTIME
+
+  # Run in the background and wait: zsh defers trap handlers until a foreground
+  # child exits, which would make SIGTERM/SIGHUP arrive only after a long
+  # upgrade finished. Waiting keeps the handler responsive and lets it signal
+  # the child. stdin is restored explicitly because zsh points an async job's
+  # stdin at /dev/null.
+  BREWSKI_TASK="$label" "$@" <&$STDIN_FD &
+  CHILD_PID=$!
+  wait "$CHILD_PID"
+  local command_status=$?
+  CHILD_PID=''
+
+  local elapsed
+  elapsed="$(printf '%.1f' $(( EPOCHREALTIME - start )))"
+
+  if (( command_status == 0 )); then
+    print -r -- "${GREEN}✅ ${label} completed${RESET} ${DIM}(${elapsed}s)${RESET}"
+    record_result "$label" "passed" "$elapsed"
+  elif [[ "$failure_kind" == "warning" ]]; then
+    print -u2 -r -- "${E_YELLOW}⚠️  ${label} returned status ${command_status}; continuing.${E_RESET}"
+    record_result "$label" "warning" "$elapsed"
+  else
+    print -u2 -r -- "${E_RED}❌ ${label} failed with status ${command_status}; continuing.${E_RESET}"
+    record_result "$label" "failed" "$elapsed"
+    OVERALL_STATUS=1
+  fi
+
+  return $command_status
+}
+
+print_summary() {
+  section "📊" "Summary"
+
+  local index state label elapsed
+  local -i width=0
+  for label in "${SUMMARY_LABELS[@]}"; do
+    (( ${#label} > width )) && width=${#label}
+  done
+
+  for (( index = 1; index <= ${#SUMMARY_LABELS}; ++index )); do
+    label="${(r:width:)SUMMARY_LABELS[$index]}"
+    state="${SUMMARY_STATES[$index]}"
+    elapsed="${SUMMARY_TIMES[$index]}"
+    case "$state" in
+      passed)
+        print -r -- "  ${GREEN}✅${RESET} ${label}  ${DIM}${elapsed}s${RESET}"
+        ;;
+      warning)
+        print -r -- "  ${YELLOW}⚠️ ${RESET} ${label}  ${DIM}${elapsed}s${RESET}"
+        ;;
+      failed)
+        print -r -- "  ${RED}❌${RESET} ${label}  ${DIM}${elapsed}s${RESET}"
+        ;;
+    esac
+  done
+
+  local total
+  total="$(printf '%.1f' $(( EPOCHREALTIME - SCRIPT_START )))"
+
+  if (( OVERALL_STATUS == 0 )); then
+    print -r -- ""
+    print -r -- "${GREEN}${BOLD}🍻 Brewski finished successfully${RESET} ${DIM}in ${total}s.${RESET}"
+  else
+    print -u2 -r -- ""
+    print -u2 -r -- "${E_RED}${E_BOLD}🍺 Brewski finished with one or more failures${E_RESET} ${E_DIM}in ${total}s.${E_RESET}"
+  fi
+}
+
+cleanup() {
+  [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]] && command rm -rf -- "$RUNTIME_DIR" 2>/dev/null
+  return 0
+}
+
+handle_interrupt() {
+  local signal="$1"
+  [[ -n "$CHILD_PID" ]] && command kill -TERM "$CHILD_PID" 2>/dev/null
+  print -u2 -r -- ""
+  print -u2 -r -- "${E_YELLOW}🛑 Brewski interrupted (SIG${signal}).${E_RESET}"
+  cleanup
+  exit 130
+}
+
+while (( $# )); do
+  case "$1" in
+    --autoremove)
+      AUTOREMOVE=true
+      ;;
+    --greedy)
+      GREEDY=true
+      ;;
+    --no-quit)
+      NO_QUIT=true
+      ;;
+    --diagnostics)
+      DIAGNOSTICS=true
+      ;;
+    --notify-test)
+      NOTIFY_TEST=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      if (( $# )); then
+        print -u2 -r -- "${E_RED}Unexpected argument: $1${E_RESET}"
+        print -u2 -r -- "Try '${PROGRAM_NAME} --help' for usage."
+        exit 2
+      fi
+      break
+      ;;
+    *)
+      print -u2 -r -- "${E_RED}Unknown option: $1${E_RESET}"
+      print -u2 -r -- "Try '${PROGRAM_NAME} --help' for usage."
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+# Deliberately before the root/Homebrew checks: this only exercises the
+# notification transport, so it is useful even on a box where brew is missing.
+if [[ "$NOTIFY_TEST" == true ]]; then
+  print -r -- "Terminal: ${TERM_PROGRAM:-unknown}  (TERM=${TERM:-unset}${TMUX:+, inside tmux})"
+  print -r -- "Protocol: $(notify_protocol)"
+  if notify "🍺 brewski test" \
+            "Notifications work. A password request will look like this."; then
+    print -r -- "${GREEN}✅ Notification sent.${RESET}"
+    print -r -- "${DIM}   Nothing shown? Allow notifications for your terminal app in${RESET}"
+    print -r -- "${DIM}   System Settings > Notifications.${RESET}"
+    exit 0
+  fi
+  print -u2 -r -- "${E_RED}❌ Could not deliver a notification.${E_RESET}"
+  exit 1
+fi
+
+(( EUID == 0 )) && die "do not run Homebrew or brewski as root."
+
+BREW="$(command -v brew 2>/dev/null)"
+[[ -n "$BREW" ]] || die "Homebrew is not installed or is not on PATH."
+
+# brewski makes its environment choices deliberately; Homebrew's suggestions
+# about those same variables are just noise here.
+export HOMEBREW_NO_ENV_HINTS=1
+
+# flock is atomic and released by the kernel on exit, including SIGKILL, so
+# there is no stale-lock heuristic to race against.
+LOCK_FILE="${TMPDIR:-/tmp}/brewski-${EUID}.lock"
+: >>"$LOCK_FILE" 2>/dev/null || die "could not create the run lock at ${LOCK_FILE}."
+zsystem flock -f LOCK_FD -t 0 "$LOCK_FILE" 2>/dev/null \
+  || die "another brewski process is already running."
+
+RUNTIME_DIR="$(command mktemp -d "${TMPDIR:-/tmp}/brewski-run.XXXXXX")" \
+  || die "could not create a runtime directory."
+export BREWSKI_RUNTIME_DIR="$RUNTIME_DIR"
+
+ASKPASS_HELPER="${RUNTIME_DIR}/askpass"
+{
+  print -r -- '#!/bin/zsh'
+  print -r -- "exec ${(q)SCRIPT_PATH} --askpass-helper \"\$@\""
+} > "$ASKPASS_HELPER" || die "could not write the askpass helper."
+command chmod 700 "$ASKPASS_HELPER" || die "could not prepare the askpass helper."
+export SUDO_ASKPASS="$ASKPASS_HELPER"
+
+# Must go through a function: `exec` with no command applies its redirections
+# permanently, so `exec {STDIN_FD}<&0 2>/dev/null` would send the whole
+# script's stderr to /dev/null and silently discard every warning and failure.
+# Redirecting the function call instead scopes the suppression to this probe.
+dup_stdin() { exec {STDIN_FD}<&0; }
+if ! dup_stdin 2>/dev/null; then
+  exec {STDIN_FD}</dev/null
+fi
+
+trap cleanup EXIT
+trap 'handle_interrupt INT' INT
+trap 'handle_interrupt TERM' TERM
+trap 'handle_interrupt HUP' HUP
+
+print -r -- "${BOLD}🍺 Brewski — Homebrew maintenance${RESET}"
+print -r -- "${DIM}${RULE}${RESET}"
+print -r -- "  Autoremove: $([[ "$AUTOREMOVE" == true ]] && print enabled || print preview-only)"
+print -r -- "  Cask mode:  $([[ "$GREEDY" == true ]] && print greedy || print versioned)"
+print -r -- "  Quit apps:  $([[ "$NO_QUIT" == true ]] && print no || print yes)"
+print -r -- "  Approval:   automatic"
+
+if [[ "$DIAGNOSTICS" == true ]]; then
+  run_task "🔍" "Homebrew configuration" "warning" "$BREW" config
+fi
+
+run_task "🔄" "Homebrew metadata update" "failure" "$BREW" update
+update_status=$?
+if (( update_status != 0 )); then
+  print -u2 -r -- "${E_RED}Stopping before upgrades because Homebrew metadata could not be updated.${E_RESET}"
+  print_summary
+  exit "$OVERALL_STATUS"
+fi
+
+outdated_command
+run_task "📋" "Available upgrade report" "warning" "${reply[@]}"
+
+run_task "📌" "Pinned package report" "warning" "$BREW" list --pinned
+
+run_task "🧪" "Formula upgrades" "failure" \
+  env HOMEBREW_NO_AUTOREMOVE=1 "$BREW" upgrade --formula --display-times --no-ask
+
+typeset -a CASK_UPGRADE
+if [[ "$GREEDY" == true ]]; then
+  CASK_UPGRADE=(env HOMEBREW_NO_AUTOREMOVE=1
+                "$BREW" upgrade --cask --greedy --display-times --no-ask)
+  CASK_LABEL="Cask upgrades (greedy)"
+else
+  CASK_UPGRADE=(env -u HOMEBREW_UPGRADE_GREEDY -u HOMEBREW_UPGRADE_GREEDY_CASKS
+                HOMEBREW_NO_AUTOREMOVE=1
+                "$BREW" upgrade --cask --greedy-auto-updates --display-times --no-ask)
+  CASK_LABEL="Cask upgrades"
+fi
+[[ "$NO_QUIT" == true ]] && CASK_UPGRADE+=(--no-quit)
+run_task "🖥️" "$CASK_LABEL" "failure" "${CASK_UPGRADE[@]}"
+
+if [[ "$AUTOREMOVE" == true ]]; then
+  run_task "♻️" "Unused dependency removal" "failure" \
+    env -u HOMEBREW_NO_AUTOREMOVE "$BREW" autoremove
+else
+  run_task "♻️" "Unused dependency preview" "warning" \
+    env -u HOMEBREW_NO_AUTOREMOVE "$BREW" autoremove --dry-run
+fi
+
+run_task "🧹" "Homebrew cleanup" "failure" \
+  env HOMEBREW_NO_AUTOREMOVE=1 "$BREW" cleanup
+
+run_task "🧯" "Unused service cleanup" "warning" "$BREW" services cleanup
+run_task "📡" "Homebrew service report" "warning" "$BREW" services list
+
+run_task "🧩" "Missing dependency check" "failure" "$BREW" missing
+run_task "🩺" "Homebrew diagnostics" "warning" "$BREW" doctor
+
+# --fix-available restricts the scan to vulnerabilities that a released version
+# actually resolves. Without it the scan reports upstream findings that have no
+# fix (fuzzer reports and the like), which brew exits non-zero for and which no
+# amount of upgrading can ever clear.
+run_task "🛡️" "Formula vulnerability scan" "warning" \
+  "$BREW" vulns --fix-available --list-skipped --max-summary=0
+
+outdated_command
+run_task "✅" "Final outdated-package check" "warning" "${reply[@]}"
+
+print_summary
+exit "$OVERALL_STATUS"
