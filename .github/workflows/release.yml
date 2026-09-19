@@ -1,0 +1,47 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate and package the tagged source
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v\d+\.\d+\.\d+', tag), 'Expected vMAJOR.MINOR.PATCH'
+          source = pathlib.Path('bin/brewski').read_text()
+          version = re.search(r"^VERSION='([^']+)'$", source, re.M).group(1)
+          assert tag == 'v' + version, 'Tag and script version differ'
+          PY
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          mkdir dist
+          git archive --format=tar.gz --prefix="brewski-${RELEASE_TAG#v}/" \
+            --output="dist/brewski-${RELEASE_TAG#v}.tar.gz" "$GITHUB_SHA"
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish release and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* --verify-tag \
+            --title "Brewski $RELEASE_TAG" --generate-notes

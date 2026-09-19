@@ -2,7 +2,9 @@
 
 A Zsh command-line tool for updating, cleaning, and checking a Homebrew installation on macOS. Run one command to upgrade packages, clean up, and get a timed summary of what passed, warned, or failed.
 
-**Status:** development version `0.1.0-dev`. Install from source for now; a versioned release and Homebrew tap are planned but not yet available.
+[![CI](https://github.com/GalDaich/brewski/actions/workflows/ci.yml/badge.svg)](https://github.com/GalDaich/brewski/actions/workflows/ci.yml)
+
+**Current version:** `0.1.0`. See [releases](https://github.com/GalDaich/brewski/releases) for source archives and SHA-256 checksums.
 
 ## What it does
 
@@ -20,11 +22,23 @@ A normal run:
 
 - macOS with `/bin/zsh` and the standard system command-line utilities.
 - [Homebrew](https://brew.sh/) available as `brew` on your `PATH`.
-- Git to clone the repository.
+- Git only if you choose to install from a source checkout.
 
 The development environment used Homebrew 7.0.4. Older Homebrew versions have not been validated and may lack flags or commands used by Brewski, including `brew vulns`. Python 3 is needed only to run the regression tests.
 
-## Get started
+## Install with Homebrew
+
+```sh
+brew install GalDaich/tap/brewski
+brewski --version
+brewski --help
+```
+
+The formula lives in [GalDaich/homebrew-tap](https://github.com/GalDaich/homebrew-tap).
+If you already have a manually installed `brewski`, back it up and remove it from
+your PATH before switching; `command -v brewski` shows which copy will run.
+
+## Run from source
 
 Clone the repository and inspect the available options:
 
@@ -115,6 +129,15 @@ Runs coordinate through a per-user lock under `~/Library/Caches/brewski`. The lo
 
 ## Update or uninstall
 
+For a Homebrew installation:
+
+```sh
+brew update
+brew upgrade GalDaich/tap/brewski
+# To uninstall:
+brew uninstall GalDaich/tap/brewski
+```
+
 To update the source checkout:
 
 ```sh
@@ -143,3 +166,7 @@ python3 -m unittest discover -s tests -v
 The 15 regression tests cover simulated Homebrew operations, option combinations, failure handling, locking, cleanup, self-upgrade recovery, process interruption, and terminal password handling with fake passwords. They do not perform real package upgrades or validate desktop notification display.
 
 The original working script is preserved at the Git tag `baseline-2026-09-19`; `main` includes the reliability fixes. Report problems through [GitHub Issues](https://github.com/GalDaich/brewski/issues), including the Brewski version, macOS/Homebrew versions, command used, and relevant output. Remove credentials or personal details from any output you share.
+
+## License
+
+[MIT](LICENSE) — copyright 2026 GalDaich.

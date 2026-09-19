@@ -47,7 +47,24 @@ it is absent from terminal output, and check echo restoration.
   summary while preserving exit status 0 if required tasks passed.
 - `HOMEBREW_NO_UPGRADE_QUIT_CASKS` is respected and reflected in the banner.
   `--no-quit` does not promise deferred installation.
-- `--version` reports `0.1.0-dev`. Notifications are described as best-effort.
+- `--version` reports `0.1.0`. Notifications are described as best-effort.
 
 The suite validates simulated maintenance and actual PTY behavior. Real Homebrew
 upgrades and desktop notification display are not automated acceptance tests.
+
+
+## Releases
+
+1. Update `VERSION` in `bin/brewski`, its version assertion in the tests, and
+   `CHANGELOG.md`. Submit and merge the change after CI passes.
+2. On the updated `main`, create an annotated `vMAJOR.MINOR.PATCH` tag and push
+   that tag. The Release workflow reruns both macOS test jobs, checks the version
+   and ancestry, and publishes a source archive plus `SHA256SUMS`.
+3. Download the release archive and verify its SHA-256. Update the URL and checksum
+   in `GalDaich/homebrew-tap/Formula/brewski.rb`, run its CI checks, and merge.
+4. Delete merged working branches locally and remotely; keep release tags.
+
+The tap is updated through ordinary commits. Release automation needs only the
+source repository's built-in token, with write access confined to the publish job.
+It has no cross-repository token. Do not move published tags or replace release
+assets; issue a new patch release for corrections.
