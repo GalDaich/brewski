@@ -346,6 +346,7 @@ class BrewskiTests(unittest.TestCase):
             os.execve(str(self.script), [str(self.script), *args], self.env)
         os.close(write_fd)
         output = b''; finished = False; wait_status = None
+        prompt_reached = False; signal_delivered = False
         try:
             end = time.monotonic() + 5
             while time.monotonic() < end:
@@ -357,7 +358,10 @@ class BrewskiTests(unittest.TestCase):
                     except OSError: break
                 if b'Password:' in output:
                     self.assertFalse(termios.tcgetattr(tty)[3] & termios.ECHO)
-                    if sig: os.killpg(pid, sig)
+                    prompt_reached = True
+                    if sig is not None:
+                        os.killpg(pid, sig)
+                        signal_delivered = True
                     else: os.write(tty, b'FAKE-test-password\n')
                     break
                 done, wait_status = os.waitpid(pid, os.WNOHANG)
@@ -379,6 +383,9 @@ class BrewskiTests(unittest.TestCase):
                     if not chunk: break
                     output += chunk
                 except OSError: break
+            if sig is not None:
+                self.assertTrue(prompt_reached, 'password prompt was not reached')
+                self.assertTrue(signal_delivered, 'requested signal was not delivered')
             self.assertTrue(termios.tcgetattr(tty)[3] & termios.ECHO, 'echo not restored')
             stdout = os.read(read_fd, 8192)
             if maintenance:
@@ -438,8 +445,19 @@ class BrewskiTests(unittest.TestCase):
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signal=sig):
                 code, output, secret = self.password(sig=sig)
-                self.assertNotEqual(code, 0)
+                self.assertEqual(code, 128 + sig, output)
                 self.assertEqual(secret, b'')
+
+    def test_password_signal_rejects_early_helper_failure(self):
+        # Mutate only the temporary helper: no prompt, echo change, or signal.
+        source = self.script.read_text()
+        anchor = 'read_tty_password() {\n'
+        self.assertEqual(source.count(anchor), 1)
+        self.script.write_text(source.replace(anchor, anchor + '  return 1\n', 1))
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig):
+                with self.assertRaisesRegex(AssertionError, 'password prompt was not reached'):
+                    self.password(sig=sig)
 
 if __name__ == '__main__':
     unittest.main()
