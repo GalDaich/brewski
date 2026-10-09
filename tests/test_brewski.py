@@ -31,17 +31,26 @@ args = sys.argv[1:]
 if args and args[0].startswith('brewski-policy-'):
     with open(os.environ['TEST_POLICY_LOG'], 'a') as f:
         f.write(json.dumps(args) + '\n')
-    if os.getenv('TEST_POLICY_FAIL') == 'exit': sys.exit(7)
-    if os.getenv('TEST_POLICY_FAIL') == 'marker':
-        print('unexpected success'); sys.exit(0)
+    probe_count = len(Path(os.environ['TEST_POLICY_LOG']).read_text().splitlines())
+    failure = os.getenv('TEST_POLICY_FAIL')
+    if probe_count == int(os.getenv('TEST_POLICY_FAIL_AT', '1')):
+        if failure == 'exit': sys.exit(7)
+        responses = {'marker': 'unexpected success\n', 'missing-state': args[3]+'\n',
+                     'invalid-state': args[3]+':yes\n', 'extra-output': args[3]+':true\nprivate value\n',
+                     'extra-newline': args[3]+':false\n\n', 'no-newline': args[3]+':true',
+                     'nul': args[3]+':true\n\0private value'}
+        if failure in responses:
+            sys.stdout.write(responses[failure]); sys.exit(0)
     checker = shutil.which('brew-' + args[0])
     if not checker: sys.exit(1)
     os.execv(checker, [checker, *args[1:]])
 with open(os.environ['TEST_LOG'], 'a') as f:
     f.write(json.dumps({'args': args, 'no_autoremove': os.getenv('HOMEBREW_NO_AUTOREMOVE'), 'greedy': os.getenv('HOMEBREW_UPGRADE_GREEDY'), 'greedy_casks': os.getenv('HOMEBREW_UPGRADE_GREEDY_CASKS'), 'askpass': os.getenv('SUDO_ASKPASS')}) + '\n')
 mode = os.getenv('TEST_MODE', '')
-if mode == 'config-change' and args == ['update']:
-    Path(os.environ['TEST_CONFIG_TO_CHANGE']).write_text('HOMEBREW_NO_AUTOREMOVE=\n')
+if mode in ('config-change', 'no-quit-change') and args == ['update']:
+    new_config = 'HOMEBREW_NO_AUTOREMOVE=\n' if mode == 'config-change' else \
+                 'HOMEBREW_NO_UPGRADE_QUIT_CASKS='+os.environ['TEST_NEW_NO_QUIT']+'\n'
+    Path(os.environ['TEST_CONFIG_TO_CHANGE']).write_text(new_config)
 if mode == 'hang' and args == ['update']:
     child = subprocess.Popen(['/bin/sleep', '60'])
     Path(os.environ['TEST_PID']).write_text(str(child.pid))
@@ -186,7 +195,7 @@ class BrewskiTests(unittest.TestCase):
                     safe = enabled if setting == 'HOMEBREW_NO_AUTOREMOVE' else not enabled
                     self.assertEqual(r.returncode, 0 if safe else 1, r.stderr)
                     if safe:
-                        self.assertEqual(r.stdout, 'policy-ok\n')
+                        self.assertEqual(r.stdout, 'policy-ok:false\n')
                         self.assertEqual(r.stderr, '')
                     else:
                         self.assertIn(setting, r.stderr)
@@ -264,12 +273,19 @@ class BrewskiTests(unittest.TestCase):
         self.assertIn('--greedy', cask['args'])
 
     def test_policy_probe_failure_and_invalid_success(self):
-        for failure in ('exit', 'marker'):
-            with self.subTest(failure=failure):
-                r = self.run_script(TEST_POLICY_FAIL=failure)
+        for failure, probe in itertools.product(
+                ('exit', 'marker', 'missing-state', 'invalid-state', 'extra-output',
+                 'extra-newline', 'no-newline', 'nul'), (1, 2)):
+            with self.subTest(failure=failure, probe=probe):
+                (self.root/'log').write_text('')
+                (self.root/'policy-log').write_text('')
+                r = self.run_script(TEST_POLICY_FAIL=failure, TEST_POLICY_FAIL_AT=str(probe))
                 self.assertEqual(r.returncode, 1, r.stderr)
                 self.assertIn('could not verify', r.stderr)
-                self.assertEqual(self.calls(), [])
+                self.assertNotIn('private value', r.stdout+r.stderr)
+                self.assertEqual([c['args'] for c in self.calls()], [] if probe == 1 else [['update']])
+                if probe == 1:
+                    self.assertNotIn('Quit apps:', r.stdout)
                 self.assert_clean()
 
     def test_config_change_during_update_blocks_upgrades(self):
@@ -339,12 +355,86 @@ class BrewskiTests(unittest.TestCase):
         self.assertIn('Could not verify remaining updates', r.stderr)
         self.assertIn('completed with 2 warning', r.stdout)
 
-    def test_inherited_no_quit(self):
-        r = self.run_script(HOMEBREW_NO_UPGRADE_QUIT_CASKS='1')
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('Quit apps:  no', r.stdout)
+    def assert_no_quit(self, result, enabled):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Quit apps:  '+('no' if enabled else 'yes'), result.stdout)
+        self.assertLess(result.stdout.index('Homebrew safety policy check completed'),
+                        result.stdout.index('Quit apps:'))
         cask = next(c['args'] for c in self.calls() if c['args'][:2] == ['upgrade', '--cask'])
-        self.assertIn('--no-quit', cask)
+        self.assertEqual('--no-quit' in cask, enabled)
+        self.assert_clean()
+
+    def test_inherited_no_quit(self):
+        cases = [(v, False) for v in (*FALSE_BOOLEANS, *BLANK_BOOLEANS)] + \
+                [(v, True) for v in TRUE_BOOLEANS]
+        for value, enabled in cases:
+            with self.subTest(value=value):
+                (self.root/'log').write_text('')
+                self.assert_no_quit(self.run_script(HOMEBREW_NO_UPGRADE_QUIT_CASKS=value), enabled)
+
+    def test_policy_probe_normalizes_no_quit(self):
+        askpass = str(self.root/'private askpass')
+        cases = [(v, False) for v in (*FALSE_BOOLEANS, *BLANK_BOOLEANS)] + \
+                [(v, True) for v in TRUE_BOOLEANS]
+        for (value, enabled), locale in itertools.product(cases, ('C', 'en_US.UTF-8')):
+            with self.subTest(value=value, locale=locale):
+                r = self.run_script('--homebrew-policy-helper', askpass, 'false', 'policy-ok',
+                                    HOMEBREW_NO_AUTOREMOVE='1', SUDO_ASKPASS=askpass,
+                                    HOMEBREW_NO_UPGRADE_QUIT_CASKS=value, LC_ALL=locale)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, 'policy-ok:'+str(enabled).lower()+'\n')
+                self.assertEqual(r.stderr, '')
+                self.assertEqual(self.calls(), [])
+
+    def test_configured_no_quit(self):
+        # Loader read trims trailing whitespace; padded tokens retain leading padding.
+        cases = [(v, False) for v in (*FALSE_BOOLEANS, '', ' ', '\t', '\u0085', '\u00a0', '\u2003')]
+        cases += [(v, True) for v in ('1', 'true', 'TRUE', 'yes', 'on', 'arbitrary',
+                                     ' false ', ' 0 ', '\tOFF\t')]
+        for value, enabled in cases:
+            with self.subTest(value=value):
+                (self.root/'log').write_text('')
+                self.configure_brew(user='HOMEBREW_NO_UPGRADE_QUIT_CASKS='+value+'\n')
+                self.assert_no_quit(self.run_script(), enabled)
+
+    def test_no_quit_configuration_precedence(self):
+        cases = [('true', 'false', 'true', '0', False, False),
+                 ('false', 'true', 'false', 'true', False, True),
+                 ('true', 'false', 'true', '', False, False),
+                 ('false', 'true', 'false', 'false', True, True)]
+        for inherited, system, prefix, user, priority, enabled in cases:
+            with self.subTest(inherited=inherited, system=system, prefix=prefix,
+                              user=user, priority=priority):
+                (self.root/'log').write_text('')
+                self.configure_brew(system='HOMEBREW_NO_UPGRADE_QUIT_CASKS='+system+'\n'+
+                                    ('HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1\n' if priority else ''),
+                                    prefix='HOMEBREW_NO_UPGRADE_QUIT_CASKS='+prefix+'\n',
+                                    user='HOMEBREW_NO_UPGRADE_QUIT_CASKS='+user+'\n')
+                self.assert_no_quit(self.run_script(HOMEBREW_NO_UPGRADE_QUIT_CASKS=inherited), enabled)
+
+    def test_explicit_no_quit_overrides_disabled_configuration(self):
+        for value in ('false', '0', ''):
+            with self.subTest(value=value):
+                (self.root/'log').write_text('')
+                self.configure_brew(user='HOMEBREW_NO_UPGRADE_QUIT_CASKS='+value+'\n')
+                self.assert_no_quit(self.run_script('--no-quit', HOMEBREW_NO_UPGRADE_QUIT_CASKS='off'), True)
+
+    def test_no_quit_recomputed_after_update(self):
+        for initial, updated, cli in itertools.product(('true', 'false'), ('true', 'false'), (False, True)):
+            with self.subTest(initial=initial, updated=updated, cli=cli):
+                (self.root/'log').write_text('')
+                (self.root/'policy-log').write_text('')
+                self.configure_brew(user='HOMEBREW_NO_UPGRADE_QUIT_CASKS='+initial+'\n')
+                r = self.run_script(*(['--no-quit'] if cli else []), TEST_MODE='no-quit-change',
+                                    TEST_NEW_NO_QUIT=updated,
+                                    TEST_CONFIG_TO_CHANGE=str(self.root/'home/.homebrew/brew.env'))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                # Banner describes the first probe; cask args use the second probe.
+                self.assertIn('Quit apps:  '+('no' if cli or initial == 'true' else 'yes'), r.stdout)
+                cask = next(c['args'] for c in self.calls() if c['args'][:2] == ['upgrade', '--cask'])
+                self.assertEqual('--no-quit' in cask, cli or updated == 'true')
+                self.assertEqual(len((self.root/'policy-log').read_text().splitlines()), 2)
+                self.assert_clean()
 
     def test_self_upgrade(self):
         r = self.run_script(TEST_MODE='self-upgrade')

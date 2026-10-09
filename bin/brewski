@@ -9,12 +9,25 @@ for module in zsh/system zsh/datetime; do
 done
 VERSION='0.1.1'
 
+# Homebrew EnvConfig's boolean:true mode (59febf998bd38, env_config.rb):
+# blank strings and exact false tokens are disabled; do not trim other values.
+homebrew_boolean_enabled() {
+  # Ruby's blank? recognizes Unicode whitespace even under a caller's C locale.
+  local LC_ALL=en_US.UTF-8
+  local value="${1:-}"
+  local nonblank="${value//[[:space:]]/}"
+  # Ruby also includes NEL, which macOS's locale space class omits.
+  [[ -n "${nonblank//$'\u0085'/}" ]] || return 1
+  [[ "${(L)value}" != (false|no|off|nil|0) ]]
+}
+
 SCRIPT_PATH="${0:A}"
 PROGRAM_NAME="${0:t}"
 AUTOREMOVE=false
 GREEDY=false
 NO_QUIT=false
-[[ -n "${HOMEBREW_NO_UPGRADE_QUIT_CASKS:-}" ]] && NO_QUIT=true
+homebrew_boolean_enabled "${HOMEBREW_NO_UPGRADE_QUIT_CASKS:-}" && NO_QUIT=true
+NO_QUIT_CLI=false
 DIAGNOSTICS=false
 NOTIFY_TEST=false
 OVERALL_STATUS=0
@@ -281,18 +294,6 @@ if [[ "${1:-}" == "--askpass-helper" ]]; then
   exit $?
 fi
 
-# Homebrew EnvConfig's boolean:true mode (59febf998bd38, env_config.rb):
-# blank strings and exact false tokens are disabled; do not trim other values.
-homebrew_boolean_enabled() {
-  # Ruby's blank? recognizes Unicode whitespace even under a caller's C locale.
-  local LC_ALL=en_US.UTF-8
-  local value="${1:-}"
-  local nonblank="${value//[[:space:]]/}"
-  # Ruby also includes NEL, which macOS's locale space class omits.
-  [[ -n "${nonblank//$'\u0085'/}" ]] || return 1
-  [[ "${(L)value}" != (false|no|off|nil|0) ]]
-}
-
 # Invoked only by the private external brew command, after Homebrew has loaded
 # brew.env. Keep diagnostics to variable names: configuration may be private.
 if [[ "${1:-}" == "--homebrew-policy-helper" ]]; then
@@ -309,7 +310,9 @@ if [[ "${1:-}" == "--homebrew-policy-helper" ]]; then
     print -u2 -r -- 'Review these settings in /etc/homebrew/brew.env, <Homebrew prefix>/etc/homebrew/brew.env, and your user brew.env (XDG_CONFIG_HOME, HOMEBREW_XDG_CONFIG_HOME, or ~/.homebrew). Remove conflicting overrides and retry; Brewski does not edit configuration.'
     exit 1
   fi
-  print -r -- "$4"
+  effective_no_quit=false
+  homebrew_boolean_enabled "${HOMEBREW_NO_UPGRADE_QUIT_CASKS:-}" && effective_no_quit=true
+  print -r -- "${4}:${effective_no_quit}"
   exit 0
 fi
 
@@ -432,9 +435,18 @@ run_task() {
   local command_status=$?
   CHILD_PID=''
 
-  if [[ "$failure_kind" == policy ]] \
-      && { (( command_status != 0 )) || [[ "$(<"$RUNTIME_DIR/outdated")" != "$POLICY_MARKER" ]]; }; then
-    die 'could not verify Homebrew safety settings; stopping before further maintenance. Review brew.env conflicts reported above, or confirm Homebrew can run external commands.'
+  if [[ "$failure_kind" == policy ]]; then
+    local policy_result
+    # Read through EOF without stripping newlines. A NUL delimiter or anything
+    # beyond the exact marker and normalized Boolean is an invalid response.
+    if (( command_status != 0 )) \
+        || IFS= read -r -d '' policy_result < "$RUNTIME_DIR/outdated" \
+        || [[ "$policy_result" != "${POLICY_MARKER}:"(true|false)$'\n' ]]; then
+      die 'could not verify Homebrew safety settings; stopping before further maintenance. Review brew.env conflicts reported above, or confirm Homebrew can run external commands.'
+    fi
+    # Recompute after every probe: a configuration change may disable no-quit.
+    NO_QUIT=$NO_QUIT_CLI
+    [[ "$policy_result" == "${POLICY_MARKER}:true"$'\n' ]] && NO_QUIT=true
   fi
 
   local elapsed
@@ -584,6 +596,7 @@ while (( $# )); do
       GREEDY=true
       ;;
     --no-quit)
+      NO_QUIT_CLI=true
       NO_QUIT=true
       ;;
     --diagnostics)
@@ -708,12 +721,12 @@ fi
 
 print -r -- "${BOLD}🍺 Brewski — Homebrew maintenance${RESET}"
 print -r -- "${DIM}${RULE}${RESET}"
+check_homebrew_policy
+
 print -r -- "  Autoremove: $([[ "$AUTOREMOVE" == true ]] && print enabled || print preview-only)"
 print -r -- "  Cask mode:  $([[ "$GREEDY" == true ]] && print greedy || print versioned)"
 print -r -- "  Quit apps:  $([[ "$NO_QUIT" == true ]] && print no || print yes)"
 print -r -- "  Approval:   automatic"
-
-check_homebrew_policy
 
 if [[ "$DIAGNOSTICS" == true ]]; then
   run_task "🔍" "Homebrew configuration" "warning" "$BREW" config
