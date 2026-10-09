@@ -237,7 +237,7 @@ class BrewskiTests(unittest.TestCase):
                 self.assertEqual(r.returncode, code, r.stderr)
         self.assertFalse(self.lock.exists())
         self.assertEqual(self.calls(), [])
-        self.assertIn('0.1.0', self.run_script('--version').stdout)
+        self.assertIn('0.1.1', self.run_script('--version').stdout)
         self.assertEqual(self.run_script().returncode, 1)
 
     def test_failure_policy(self):

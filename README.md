@@ -4,7 +4,7 @@ A Zsh command-line tool for updating, cleaning, and checking a Homebrew installa
 
 [![CI](https://github.com/GalDaich/brewski/actions/workflows/ci.yml/badge.svg)](https://github.com/GalDaich/brewski/actions/workflows/ci.yml)
 
-**Current version:** `0.1.0`. See [releases](https://github.com/GalDaich/brewski/releases) for source archives and SHA-256 checksums.
+**Current version:** `0.1.1`. See [releases](https://github.com/GalDaich/brewski/releases) for source archives and SHA-256 checksums.
 
 ## What it does
 
