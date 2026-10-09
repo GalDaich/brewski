@@ -19,6 +19,11 @@ import time
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'bin/brewski'
+FALSE_BOOLEANS = ('0', 'false', 'FALSE', 'FaLsE', 'no', 'NO', 'No',
+                  'off', 'OFF', 'OfF', 'nil', 'NIL', 'NiL')
+BLANK_BOOLEANS = ('', ' ', '\t\n\r\v\f', '\u00a0', '\u2003')
+TRUE_BOOLEANS = ('1', 'true', 'TRUE', 'yes', 'on', 'arbitrary',
+                 ' false ', 'false ', ' 0 ', '\tOFF\t')
 MOCK = r'''
 import json, os, subprocess, sys, time, signal, shutil
 from pathlib import Path
@@ -156,12 +161,83 @@ class BrewskiTests(unittest.TestCase):
         self.assertEqual(self.run_script().returncode, 0)
 
     def test_false_boolean_autoremove_settings_block_maintenance(self):
-        for value in ('0', 'false', 'FALSE', 'no', 'off', 'nil', '   '):
+        for value in (*FALSE_BOOLEANS, '', '   ', '\u00a0', '\u2003'):
             with self.subTest(value=value):
                 self.configure_brew(user='HOMEBREW_NO_AUTOREMOVE='+value+'\n')
                 r = self.run_script()
                 self.assertEqual(r.returncode, 1, r.stderr)
                 self.assertIn('HOMEBREW_NO_AUTOREMOVE', r.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assert_clean()
+
+    def test_policy_boolean_meanings_in_inherited_environment(self):
+        # Direct helper calls preserve whitespace that brew.env's read trims.
+        askpass = str(self.root/'private askpass')
+        cases = [(v, False) for v in (*FALSE_BOOLEANS, *BLANK_BOOLEANS)] + \
+                [(v, True) for v in TRUE_BOOLEANS]
+        for (value, enabled), locale in itertools.product(cases, ('C', 'en_US.UTF-8')):
+            for setting in ('HOMEBREW_NO_AUTOREMOVE', 'HOMEBREW_UPGRADE_GREEDY'):
+                with self.subTest(setting=setting, value=value, locale=locale):
+                    env = {'HOMEBREW_NO_AUTOREMOVE': '1', 'HOMEBREW_UPGRADE_GREEDY': '',
+                           'HOMEBREW_UPGRADE_GREEDY_CASKS': '', 'SUDO_ASKPASS': askpass}
+                    env[setting] = value
+                    r = self.run_script('--homebrew-policy-helper', askpass, 'false', 'policy-ok',
+                                        LC_ALL=locale, **env)
+                    safe = enabled if setting == 'HOMEBREW_NO_AUTOREMOVE' else not enabled
+                    self.assertEqual(r.returncode, 0 if safe else 1, r.stderr)
+                    if safe:
+                        self.assertEqual(r.stdout, 'policy-ok\n')
+                        self.assertEqual(r.stderr, '')
+                    else:
+                        self.assertIn(setting, r.stderr)
+                        self.assertEqual(r.stdout, '')
+                    self.assertEqual(self.calls(), [])
+
+    def test_compatible_boolean_configurations_allow_maintenance(self):
+        # read -r trims line-end whitespace; leading padding after '=' survives.
+        settings = [('HOMEBREW_NO_AUTOREMOVE', value) for value in
+                    ('1', 'true', 'TRUE', 'yes', 'on', 'arbitrary', ' false ', ' 0 ')]
+        settings += [('HOMEBREW_UPGRADE_GREEDY', value) for value in
+                     (*FALSE_BOOLEANS, '', '   ', '\t', '\u00a0', '\u2003')]
+        for setting, value in settings:
+            with self.subTest(setting=setting, value=value):
+                (self.root/'log').write_text('')
+                self.configure_brew(user=setting+'='+value+'\n')
+                r = self.run_script()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                commands = [c['args'] for c in self.calls()]
+                self.assertIn(['cleanup'], commands)
+                cask = next(c for c in commands if c[:2] == ['upgrade', '--cask'])
+                self.assertNotIn('--greedy', cask)
+                self.assert_clean()
+
+    def test_greedy_boolean_configurations_block_maintenance(self):
+        for value in ('true', 'arbitrary', ' false ', ' 0 '):
+            with self.subTest(value=value):
+                self.configure_brew(user='HOMEBREW_UPGRADE_GREEDY='+value+'\n')
+                r = self.run_script()
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('HOMEBREW_UPGRADE_GREEDY', r.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assert_clean()
+
+    def test_greedy_cask_list_is_never_boolean_parsed(self):
+        for value in ('0', 'false', 'OFF', '   ', '\t', '\u00a0'):
+            with self.subTest(value=value):
+                askpass = str(self.root/'private askpass')
+                r = self.run_script('--homebrew-policy-helper', askpass, 'false', 'policy-ok',
+                                    HOMEBREW_NO_AUTOREMOVE='true', HOMEBREW_UPGRADE_GREEDY='false',
+                                    HOMEBREW_UPGRADE_GREEDY_CASKS=value, SUDO_ASKPASS=askpass)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('HOMEBREW_UPGRADE_GREEDY_CASKS', r.stderr)
+                self.assertEqual(r.stdout, '')
+                self.assertEqual(self.calls(), [])
+        for value in ('0', 'false', 'OFF'):
+            with self.subTest(config_value=value):
+                self.configure_brew(user='HOMEBREW_UPGRADE_GREEDY_CASKS='+value+'\n')
+                r = self.run_script()
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('HOMEBREW_UPGRADE_GREEDY_CASKS', r.stderr)
                 self.assertEqual(self.calls(), [])
                 self.assert_clean()
 

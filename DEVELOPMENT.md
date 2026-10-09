@@ -57,6 +57,12 @@ it is absent from terminal output, and check echo restoration.
   scope, or the private askpass helper stop the run with configuration guidance.
   Brewski does not edit configuration. Concurrent configuration changes after a
   check remain outside this guarantee; avoid changing `brew.env` during a run.
+  Boolean policy settings follow Homebrew's `boolean: true` parsing: empty or
+  whitespace-only values and exact `false`, `no`, `off`, `nil`, or `0` tokens
+  (case-insensitive) are disabled; all other values are enabled. Padded false
+  tokens are enabled. The cask-list setting remains a string/list, and the
+  askpass setting must equal the private helper path. This behavior was checked
+  against Homebrew revision `59febf998bd38fdbbac2f6d2d1e591cfa109a7d6`.
 
 The suite validates simulated maintenance and actual PTY behavior. Real Homebrew
 upgrades and desktop notification display are not automated acceptance tests.

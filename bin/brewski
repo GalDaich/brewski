@@ -281,16 +281,24 @@ if [[ "${1:-}" == "--askpass-helper" ]]; then
   exit $?
 fi
 
+# Homebrew EnvConfig's boolean:true mode (59febf998bd38, env_config.rb):
+# blank strings and exact false tokens are disabled; do not trim other values.
+homebrew_boolean_enabled() {
+  # Ruby's blank? recognizes Unicode whitespace even under a caller's C locale.
+  local LC_ALL=en_US.UTF-8
+  local value="${1:-}"
+  [[ -n "${value//[[:space:]]/}" ]] || return 1
+  [[ "${(L)value}" != (false|no|off|nil|0) ]]
+}
+
 # Invoked only by the private external brew command, after Homebrew has loaded
 # brew.env. Keep diagnostics to variable names: configuration may be private.
 if [[ "${1:-}" == "--homebrew-policy-helper" ]]; then
   (( $# == 4 )) || exit 1
   typeset -a conflicts=()
-  # Homebrew's boolean parser treats values such as 0/false/off as disabled.
-  # Require the value supplied to maintenance instead of guessing truthiness.
-  [[ "${HOMEBREW_NO_AUTOREMOVE:-}" == 1 ]] || conflicts+=(HOMEBREW_NO_AUTOREMOVE)
+  homebrew_boolean_enabled "${HOMEBREW_NO_AUTOREMOVE:-}" || conflicts+=(HOMEBREW_NO_AUTOREMOVE)
   if [[ "$3" != true ]]; then
-    [[ -z "${HOMEBREW_UPGRADE_GREEDY:-}" ]] || conflicts+=(HOMEBREW_UPGRADE_GREEDY)
+    homebrew_boolean_enabled "${HOMEBREW_UPGRADE_GREEDY:-}" && conflicts+=(HOMEBREW_UPGRADE_GREEDY)
     [[ -z "${HOMEBREW_UPGRADE_GREEDY_CASKS:-}" ]] || conflicts+=(HOMEBREW_UPGRADE_GREEDY_CASKS)
   fi
   [[ "${SUDO_ASKPASS:-}" == "$2" ]] || conflicts+=(SUDO_ASKPASS)
