@@ -286,7 +286,9 @@ fi
 if [[ "${1:-}" == "--homebrew-policy-helper" ]]; then
   (( $# == 4 )) || exit 1
   typeset -a conflicts=()
-  [[ -n "${HOMEBREW_NO_AUTOREMOVE:-}" ]] || conflicts+=(HOMEBREW_NO_AUTOREMOVE)
+  # Homebrew's boolean parser treats values such as 0/false/off as disabled.
+  # Require the value supplied to maintenance instead of guessing truthiness.
+  [[ "${HOMEBREW_NO_AUTOREMOVE:-}" == 1 ]] || conflicts+=(HOMEBREW_NO_AUTOREMOVE)
   if [[ "$3" != true ]]; then
     [[ -z "${HOMEBREW_UPGRADE_GREEDY:-}" ]] || conflicts+=(HOMEBREW_UPGRADE_GREEDY)
     [[ -z "${HOMEBREW_UPGRADE_GREEDY_CASKS:-}" ]] || conflicts+=(HOMEBREW_UPGRADE_GREEDY_CASKS)

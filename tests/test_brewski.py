@@ -151,6 +151,16 @@ class BrewskiTests(unittest.TestCase):
                             user='HOMEBREW_UPGRADE_GREEDY=\nHOMEBREW_UPGRADE_GREEDY_CASKS=\n')
         self.assertEqual(self.run_script().returncode, 0)
 
+    def test_false_boolean_autoremove_settings_block_maintenance(self):
+        for value in ('0', 'false', 'FALSE', 'no', 'off', 'nil', '   '):
+            with self.subTest(value=value):
+                self.configure_brew(user='HOMEBREW_NO_AUTOREMOVE='+value+'\n')
+                r = self.run_script()
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('HOMEBREW_NO_AUTOREMOVE', r.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assert_clean()
+
     def test_xdg_configuration_precedence(self):
         self.configure_brew()
         for name in ('xdg', 'brew-xdg'):
