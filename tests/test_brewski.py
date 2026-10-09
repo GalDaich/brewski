@@ -21,7 +21,7 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[1] / 'bin/brewski'
 FALSE_BOOLEANS = ('0', 'false', 'FALSE', 'FaLsE', 'no', 'NO', 'No',
                   'off', 'OFF', 'OfF', 'nil', 'NIL', 'NiL')
-BLANK_BOOLEANS = ('', ' ', '\t\n\r\v\f', '\u00a0', '\u2003')
+BLANK_BOOLEANS = ('', ' ', '\t\n\r\v\f', '\u0085', '\u00a0', '\u2003')
 TRUE_BOOLEANS = ('1', 'true', 'TRUE', 'yes', 'on', 'arbitrary',
                  ' false ', 'false ', ' 0 ', '\tOFF\t')
 MOCK = r'''
@@ -161,7 +161,7 @@ class BrewskiTests(unittest.TestCase):
         self.assertEqual(self.run_script().returncode, 0)
 
     def test_false_boolean_autoremove_settings_block_maintenance(self):
-        for value in (*FALSE_BOOLEANS, '', '   ', '\u00a0', '\u2003'):
+        for value in (*FALSE_BOOLEANS, '', '   ', '\u0085', '\u00a0', '\u2003'):
             with self.subTest(value=value):
                 self.configure_brew(user='HOMEBREW_NO_AUTOREMOVE='+value+'\n')
                 r = self.run_script()
@@ -198,7 +198,7 @@ class BrewskiTests(unittest.TestCase):
         settings = [('HOMEBREW_NO_AUTOREMOVE', value) for value in
                     ('1', 'true', 'TRUE', 'yes', 'on', 'arbitrary', ' false ', ' 0 ')]
         settings += [('HOMEBREW_UPGRADE_GREEDY', value) for value in
-                     (*FALSE_BOOLEANS, '', '   ', '\t', '\u00a0', '\u2003')]
+                     (*FALSE_BOOLEANS, '', '   ', '\t', '\u0085', '\u00a0', '\u2003')]
         for setting, value in settings:
             with self.subTest(setting=setting, value=value):
                 (self.root/'log').write_text('')
@@ -222,7 +222,7 @@ class BrewskiTests(unittest.TestCase):
                 self.assert_clean()
 
     def test_greedy_cask_list_is_never_boolean_parsed(self):
-        for value in ('0', 'false', 'OFF', '   ', '\t', '\u00a0'):
+        for value in ('0', 'false', 'OFF', '   ', '\t', '\u0085', '\u00a0'):
             with self.subTest(value=value):
                 askpass = str(self.root/'private askpass')
                 r = self.run_script('--homebrew-policy-helper', askpass, 'false', 'policy-ok',

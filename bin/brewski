@@ -287,7 +287,9 @@ homebrew_boolean_enabled() {
   # Ruby's blank? recognizes Unicode whitespace even under a caller's C locale.
   local LC_ALL=en_US.UTF-8
   local value="${1:-}"
-  [[ -n "${value//[[:space:]]/}" ]] || return 1
+  local nonblank="${value//[[:space:]]/}"
+  # Ruby also includes NEL, which macOS's locale space class omits.
+  [[ -n "${nonblank//$'\u0085'/}" ]] || return 1
   [[ "${(L)value}" != (false|no|off|nil|0) ]]
 }
 
