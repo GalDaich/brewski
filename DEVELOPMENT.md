@@ -48,6 +48,12 @@ it is absent from terminal output, and check echo restoration.
 - `HOMEBREW_NO_UPGRADE_QUIT_CASKS` is respected and reflected in the banner.
   `--no-quit` does not promise deferred installation.
 - `--version` reports `0.1.0`. Notifications are described as best-effort.
+- A private external Homebrew command checks the effective environment after
+  system, prefix, and user `brew.env` loading, before metadata update and again
+  before upgrades. Conflicts with automatic-removal safeguards, versioned cask
+  scope, or the private askpass helper stop the run with configuration guidance.
+  Brewski does not edit configuration. Concurrent configuration changes after a
+  check remain outside this guarantee; avoid changing `brew.env` during a run.
 
 The suite validates simulated maintenance and actual PTY behavior. Real Homebrew
 upgrades and desktop notification display are not automated acceptance tests.

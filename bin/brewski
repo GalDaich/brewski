@@ -281,6 +281,28 @@ if [[ "${1:-}" == "--askpass-helper" ]]; then
   exit $?
 fi
 
+# Invoked only by the private external brew command, after Homebrew has loaded
+# brew.env. Keep diagnostics to variable names: configuration may be private.
+if [[ "${1:-}" == "--homebrew-policy-helper" ]]; then
+  (( $# == 4 )) || exit 1
+  typeset -a conflicts=()
+  # Homebrew's boolean parser treats values such as 0/false/off as disabled.
+  # Require the value supplied to maintenance instead of guessing truthiness.
+  [[ "${HOMEBREW_NO_AUTOREMOVE:-}" == 1 ]] || conflicts+=(HOMEBREW_NO_AUTOREMOVE)
+  if [[ "$3" != true ]]; then
+    [[ -z "${HOMEBREW_UPGRADE_GREEDY:-}" ]] || conflicts+=(HOMEBREW_UPGRADE_GREEDY)
+    [[ -z "${HOMEBREW_UPGRADE_GREEDY_CASKS:-}" ]] || conflicts+=(HOMEBREW_UPGRADE_GREEDY_CASKS)
+  fi
+  [[ "${SUDO_ASKPASS:-}" == "$2" ]] || conflicts+=(SUDO_ASKPASS)
+  if (( ${#conflicts} )); then
+    print -u2 -r -- "${PROGRAM_NAME}: Homebrew configuration conflicts with the run policy: ${conflicts[*]}."
+    print -u2 -r -- 'Review these settings in /etc/homebrew/brew.env, <Homebrew prefix>/etc/homebrew/brew.env, and your user brew.env (XDG_CONFIG_HOME, HOMEBREW_XDG_CONFIG_HOME, or ~/.homebrew). Remove conflicting overrides and retry; Brewski does not edit configuration.'
+    exit 1
+  fi
+  print -r -- "$4"
+  exit 0
+fi
+
 # ---------------------------------------------------------------------------
 
 usage() {
@@ -390,7 +412,7 @@ run_task() {
   # upgrade finished. Waiting keeps the handler responsive and lets it signal
   # the child. stdin is restored explicitly because zsh points an async job's
   # stdin at /dev/null.
-  if [[ "$failure_kind" == verification ]]; then
+  if [[ "$failure_kind" == (verification|policy) ]]; then
     BREWSKI_TASK="$label" "$@" <&$STDIN_FD >"$RUNTIME_DIR/outdated" &
   else
     BREWSKI_TASK="$label" "$@" <&$STDIN_FD &
@@ -399,6 +421,11 @@ run_task() {
   wait "$CHILD_PID"
   local command_status=$?
   CHILD_PID=''
+
+  if [[ "$failure_kind" == policy ]] \
+      && { (( command_status != 0 )) || [[ "$(<"$RUNTIME_DIR/outdated")" != "$POLICY_MARKER" ]]; }; then
+    die 'could not verify Homebrew safety settings; stopping before further maintenance. Review brew.env conflicts reported above, or confirm Homebrew can run external commands.'
+  fi
 
   local elapsed
   elapsed="$(printf '%.1f' $(( EPOCHREALTIME - start )))"
@@ -640,6 +667,26 @@ ASKPASS_HELPER="${RUNTIME_DIR}/askpass"
 command chmod 700 "$ASKPASS_HELPER" || die "could not prepare the askpass helper."
 export SUDO_ASKPASS="$ASKPASS_HELPER"
 
+# A supported external Homebrew command sees the environment after brew.env
+# loading. The unique private filename avoids ordinary command collisions.
+POLICY_COMMAND="brewski-policy-${RUNTIME_DIR:t}"
+POLICY_MARKER="BREWSKI_POLICY_OK:${RUNTIME_DIR}"
+{
+  print -r -- '#!/bin/zsh -f'
+  print -r -- "exec /bin/zsh -f ${(q)RUNTIME_DIR}/brewski --homebrew-policy-helper \"\$@\""
+} > "$RUNTIME_DIR/brew-$POLICY_COMMAND" || die 'could not write the Homebrew policy checker.'
+command chmod 700 "$RUNTIME_DIR/brew-$POLICY_COMMAND" || die 'could not prepare the Homebrew policy checker.'
+
+check_homebrew_policy() {
+  # Nested brew invocations can restore HOMEBREW_PATH before command lookup.
+  # Scope the private PATH and normalized environment to this read-only probe.
+  run_task '🔒' 'Homebrew safety policy check' policy \
+    env -u HOMEBREW_BREW_FILE -u HOMEBREW_PATH \
+        -u HOMEBREW_UPGRADE_GREEDY -u HOMEBREW_UPGRADE_GREEDY_CASKS \
+        HOMEBREW_NO_AUTOREMOVE=1 PATH="$RUNTIME_DIR:$PATH" \
+        "$BREW" "$POLICY_COMMAND" "$ASKPASS_HELPER" "$GREEDY" "$POLICY_MARKER"
+}
+
 # Must go through a function: `exec` with no command applies its redirections
 # permanently, so `exec {STDIN_FD}<&0 2>/dev/null` would send the whole
 # script's stderr to /dev/null and silently discard every warning and failure.
@@ -656,6 +703,8 @@ print -r -- "  Cask mode:  $([[ "$GREEDY" == true ]] && print greedy || print ve
 print -r -- "  Quit apps:  $([[ "$NO_QUIT" == true ]] && print no || print yes)"
 print -r -- "  Approval:   automatic"
 
+check_homebrew_policy
+
 if [[ "$DIAGNOSTICS" == true ]]; then
   run_task "🔍" "Homebrew configuration" "warning" "$BREW" config
 fi
@@ -667,6 +716,10 @@ if (( update_status != 0 )); then
   print_summary
   exit "$OVERALL_STATUS"
 fi
+
+# Updating Homebrew can change its loader or configuration. Recheck before
+# upgrades. Concurrent configuration changes after a probe remain possible.
+check_homebrew_policy
 
 outdated_command
 run_task "📋" "Available upgrade report" "warning" "${reply[@]}"
