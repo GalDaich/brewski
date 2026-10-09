@@ -20,12 +20,23 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'bin/brewski'
 MOCK = r'''
-import json, os, subprocess, sys, time, signal
+import json, os, subprocess, sys, time, signal, shutil
 from pathlib import Path
 args = sys.argv[1:]
+if args and args[0].startswith('brewski-policy-'):
+    with open(os.environ['TEST_POLICY_LOG'], 'a') as f:
+        f.write(json.dumps(args) + '\n')
+    if os.getenv('TEST_POLICY_FAIL') == 'exit': sys.exit(7)
+    if os.getenv('TEST_POLICY_FAIL') == 'marker':
+        print('unexpected success'); sys.exit(0)
+    checker = shutil.which('brew-' + args[0])
+    if not checker: sys.exit(1)
+    os.execv(checker, [checker, *args[1:]])
 with open(os.environ['TEST_LOG'], 'a') as f:
-    f.write(json.dumps({'args': args, 'no_autoremove': os.getenv('HOMEBREW_NO_AUTOREMOVE'), 'greedy': os.getenv('HOMEBREW_UPGRADE_GREEDY')}) + '\n')
+    f.write(json.dumps({'args': args, 'no_autoremove': os.getenv('HOMEBREW_NO_AUTOREMOVE'), 'greedy': os.getenv('HOMEBREW_UPGRADE_GREEDY'), 'greedy_casks': os.getenv('HOMEBREW_UPGRADE_GREEDY_CASKS'), 'askpass': os.getenv('SUDO_ASKPASS')}) + '\n')
 mode = os.getenv('TEST_MODE', '')
+if mode == 'config-change' and args == ['update']:
+    Path(os.environ['TEST_CONFIG_TO_CHANGE']).write_text('HOMEBREW_NO_AUTOREMOVE=\n')
 if mode == 'hang' and args == ['update']:
     child = subprocess.Popen(['/bin/sleep', '60'])
     Path(os.environ['TEST_PID']).write_text(str(child.pid))
@@ -67,9 +78,11 @@ class BrewskiTests(unittest.TestCase):
         self.script.write_text(source.replace(old, 'LOCK_DIR="' + str(self.lock) + '"'))
         self.script.chmod(0o755)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(('HOMEBREW_', 'BREWSKI_'))}
+        self.env.pop('XDG_CONFIG_HOME', None)
         self.env.update(PATH=str(self.bin) + ':/usr/bin:/bin:/usr/sbin:/sbin',
                         TMPDIR=str(self.tmp), TERM='xterm', NO_COLOR='1',
                         TEST_LOG=str(self.root/'log'), TEST_PID=str(self.root/'pid'),
+                        TEST_POLICY_LOG=str(self.root/'policy-log'),
                         TEST_SCRIPT=str(self.script), BREWSKI_RUNTIME_DIR=str(self.tmp))
         self.stub('brew', '#!' + sys.executable + '\n' + MOCK)
         self.stub('osascript', '#!/bin/sh\nexit 1\n')
@@ -91,6 +104,95 @@ class BrewskiTests(unittest.TestCase):
 
     def assert_clean(self):
         self.assertEqual(list(self.tmp.glob('brewski-run.*')), [])
+
+    def configure_brew(self, system='', prefix='', user=''):
+        """Execute the real private checker after a Homebrew-style loader."""
+        for name, text in [('system.env', system), ('prefix/etc/homebrew/brew.env', prefix),
+                           ('home/.homebrew/brew.env', user)]:
+            target = self.root/name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        self.env.update(HOME=str(self.root/'home'), TEST_SYSTEM_CONFIG=str(self.root/'system.env'),
+                        TEST_PREFIX=str(self.root/'prefix'), TEST_MOCK=str(self.root/'mock.py'),
+                        TEST_PYTHON=sys.executable)
+        (self.root/'mock.py').write_text(MOCK)
+        self.stub('brew', (SOURCE.parents[1]/'tests/fixtures/brew-with-config').read_text())
+
+    def test_configuration_conflicts_block_all_maintenance(self):
+        for level in ('system', 'prefix', 'user'):
+            for setting in ('HOMEBREW_NO_AUTOREMOVE=', 'HOMEBREW_UPGRADE_GREEDY=1',
+                            'HOMEBREW_UPGRADE_GREEDY_CASKS=example',
+                            'SUDO_ASKPASS=/private/configured helper', 'SUDO_ASKPASS='):
+                with self.subTest(level=level, setting=setting):
+                    self.configure_brew(**{level: setting+'\n'})
+                    r = self.run_script()
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    self.assertIn(setting.split('=')[0], r.stderr)
+                    self.assertIn('brew.env', r.stderr)
+                    self.assertNotIn('/private/configured helper', r.stderr)
+                    self.assertEqual(self.calls(), [])
+                    self.assert_clean()
+
+    def test_configuration_precedence(self):
+        for priority, code in [(False, 0), (True, 1)]:
+            with self.subTest(priority=priority):
+                (self.root/'log').write_text('')
+                self.configure_brew(system='HOMEBREW_NO_AUTOREMOVE=\n'+
+                                    ('HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1\n' if priority else ''),
+                                    prefix='HOMEBREW_NO_AUTOREMOVE=1\n',
+                                    user='HOMEBREW_NO_AUTOREMOVE=1\n')
+                r = self.run_script()
+                self.assertEqual(r.returncode, code, r.stderr)
+                if priority: self.assertEqual(self.calls(), [])
+                else: self.assertIn(['cleanup'], [c['args'] for c in self.calls()])
+                self.assert_clean()
+        # A user file can clear an earlier greedy override; empty is disabled.
+        self.configure_brew(prefix='HOMEBREW_UPGRADE_GREEDY=1\nHOMEBREW_UPGRADE_GREEDY_CASKS=example\n',
+                            user='HOMEBREW_UPGRADE_GREEDY=\nHOMEBREW_UPGRADE_GREEDY_CASKS=\n')
+        self.assertEqual(self.run_script().returncode, 0)
+
+    def test_xdg_configuration_precedence(self):
+        self.configure_brew()
+        for name in ('xdg', 'brew-xdg'):
+            config = self.root/name/'homebrew/brew.env'
+            config.parent.mkdir(parents=True)
+            config.write_text('HOMEBREW_NO_AUTOREMOVE=\n')
+        for env in ({'XDG_CONFIG_HOME': str(self.root/'xdg')},
+                    {'HOMEBREW_XDG_CONFIG_HOME': str(self.root/'brew-xdg')},
+                    {'XDG_CONFIG_HOME': str(self.root/'unused'),
+                     'HOMEBREW_XDG_CONFIG_HOME': str(self.root/'brew-xdg')}):
+            with self.subTest(env=env):
+                self.assertEqual(self.run_script(**env).returncode, 0 if 'unused' in env.get('XDG_CONFIG_HOME', '') else 1)
+        self.configure_brew(prefix='HOMEBREW_XDG_CONFIG_HOME='+str(self.root/'brew-xdg')+'\n')
+        self.assertEqual(self.run_script().returncode, 1)
+
+    def test_greedy_config_requires_explicit_mode(self):
+        self.configure_brew(user='HOMEBREW_UPGRADE_GREEDY=1\nHOMEBREW_UPGRADE_GREEDY_CASKS=example\n')
+        r = self.run_script('--greedy')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cask = next(c for c in self.calls() if c['args'][:2] == ['upgrade', '--cask'])
+        self.assertIn('--greedy', cask['args'])
+
+    def test_policy_probe_failure_and_invalid_success(self):
+        for failure in ('exit', 'marker'):
+            with self.subTest(failure=failure):
+                r = self.run_script(TEST_POLICY_FAIL=failure)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn('could not verify', r.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assert_clean()
+
+    def test_config_change_during_update_blocks_upgrades(self):
+        self.configure_brew()
+        r = self.run_script(TEST_MODE='config-change', TEST_CONFIG_TO_CHANGE=str(self.root/'home/.homebrew/brew.env'))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual([c['args'] for c in self.calls()], [['update']])
+        self.assert_clean()
+
+    def test_nested_brew_path_does_not_shadow_checker(self):
+        self.configure_brew()
+        r = self.run_script(HOMEBREW_BREW_FILE='/fake/bin/brew', HOMEBREW_PATH='/nonexistent')
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_options(self):
         flags = ['--autoremove', '--greedy', '--no-quit', '--diagnostics']
