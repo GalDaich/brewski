@@ -50,7 +50,7 @@ it is absent from terminal output, and check echo restoration.
   summary while preserving exit status 0 if required tasks passed.
 - `HOMEBREW_NO_UPGRADE_QUIT_CASKS` is respected and reflected in the banner.
   `--no-quit` does not promise deferred installation.
-- `--version` reports `0.1.0`. Notifications are described as best-effort.
+- `--version` reports `0.1.1`. Notifications are described as best-effort.
 - A private external Homebrew command checks the effective environment after
   system, prefix, and user `brew.env` loading, before metadata update and again
   before upgrades. Conflicts with automatic-removal safeguards, versioned cask

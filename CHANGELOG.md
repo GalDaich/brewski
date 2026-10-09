@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Stop before maintenance when Homebrew configuration overrides autoremove,
+  cask upgrade scope, or the private password helper; check again after updating
+  Homebrew metadata.
+- Keep sudo password responses free of user Zsh startup output, including when
+  the installed Brewski copy changes during upgrades.
+
 ## 0.1.0
 
 First public release of Brewski, a macOS Homebrew maintenance command.
