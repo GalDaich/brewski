@@ -30,6 +30,9 @@ it is absent from terminal output, and check echo restoration.
   cannot be disabled. Signal handlers restore settings and exit.
 - Each run retains a private script snapshot for sudo's askpass helper, so
   upgrading or removing the installed version does not break later prompts.
+- Both askpass entry points disable user Zsh startup files before execution,
+  keeping `.zshenv` output out of the password response. Zsh still reads the
+  system `/etc/zshenv`; this does not isolate administrator startup configuration.
 - Cancellation stops and enumerates the child tree, sends TERM, allows up to
   three seconds for shutdown, then uses KILL on survivors and waits for the
   immediate child. SIGINT, SIGTERM, and SIGHUP return 130, 143, and 129.

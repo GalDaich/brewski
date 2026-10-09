@@ -55,6 +55,10 @@ if mode == 'self-upgrade' and args[:2] == ['upgrade', '--cask']:
     assert result.returncode == 1, result
     assert 'no terminal is available' in result.stderr, result.stderr
     assert result.stdout == '', result.stdout
+if mode == 'askpass' and args[:2] == ['upgrade', '--cask']:
+    result = subprocess.run([os.environ['SUDO_ASKPASS'], 'Password:'], capture_output=True)
+    Path(os.environ['TEST_PASSWORD_RESPONSE']).write_bytes(result.stdout)
+    sys.exit(result.returncode)
 if mode == 'outdated' and args[0] == 'outdated':
     print('example (1.0) < 2.0 [pinned]')
 if ' '.join(args) == os.getenv('TEST_FAIL'):
@@ -325,16 +329,21 @@ class BrewskiTests(unittest.TestCase):
                 else: self.fail('descendant survived cancellation')
                 self.assert_clean()
 
-    def password(self, fail='', sig=None):
+    def password(self, fail='', sig=None, maintenance=False):
         if fail:
             self.stub('stty', '#!/bin/sh\ncase "$1" in ' + fail + ') exit 1;; esac\nexec /bin/stty "$@"\n')
         # A separate stdout pipe verifies passwords never mix with prompts.
+        # Maintenance captures the generated helper's response in the fake brew.
+        response = self.root/'password-response'
+        if maintenance:
+            self.env.update(TEST_MODE='askpass', TEST_PASSWORD_RESPONSE=str(response))
         read_fd, write_fd = os.pipe()
         pid, tty = pty.fork()
         if pid == 0:
             os.close(read_fd)
             os.dup2(write_fd, 1); os.close(write_fd)
-            os.execve(str(self.script), [str(self.script), '--askpass-helper', 'Password:'], self.env)
+            args = [] if maintenance else ['--askpass-helper', 'Password:']
+            os.execve(str(self.script), [str(self.script), *args], self.env)
         os.close(write_fd)
         output = b''; finished = False; wait_status = None
         try:
@@ -371,7 +380,10 @@ class BrewskiTests(unittest.TestCase):
                     output += chunk
                 except OSError: break
             self.assertTrue(termios.tcgetattr(tty)[3] & termios.ECHO, 'echo not restored')
-            secret = os.read(read_fd, 8192)
+            stdout = os.read(read_fd, 8192)
+            if maintenance:
+                self.assertNotIn(b'FAKE-test-password', stdout)
+            secret = response.read_bytes() if maintenance else stdout
             self.assertNotIn(b'FAKE-test-password', output)
             return os.waitstatus_to_exitcode(wait_status), output, secret
         finally:
@@ -387,6 +399,26 @@ class BrewskiTests(unittest.TestCase):
         code, output, secret = self.password()
         self.assertEqual(code, 0, output)
         self.assertEqual(secret, b'FAKE-test-password\n')
+
+    def noisy_zshenv(self):
+        zdotdir = self.root/'zdot'
+        zdotdir.mkdir()
+        (zdotdir/'.zshenv').write_text('print -r -- startup-banner\n')
+        self.env['ZDOTDIR'] = str(zdotdir)
+
+    def test_password_ignores_user_startup_output(self):
+        self.noisy_zshenv()
+        code, output, secret = self.password()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(secret, b'FAKE-test-password\n')
+
+    def test_generated_askpass_ignores_user_startup_output(self):
+        self.noisy_zshenv()
+        code, output, secret = self.password(maintenance=True)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(secret, b'FAKE-test-password\n')
+        self.assertIn(['cleanup'], [call['args'] for call in self.calls()])
+        self.assert_clean()
 
     def test_password_stty_save_failure(self):
         code, output, secret = self.password(fail='-g')
