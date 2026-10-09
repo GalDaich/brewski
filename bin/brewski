@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 
 # brewski - Update, clean, and verify a Homebrew installation.
 
@@ -661,7 +661,7 @@ command cp -- "$SCRIPT_PATH" "$RUNTIME_DIR/brewski" || die "could not snapshot t
 command chmod 700 "$RUNTIME_DIR/brewski" || die "could not secure the password helper snapshot."
 ASKPASS_HELPER="${RUNTIME_DIR}/askpass"
 {
-  print -r -- '#!/bin/zsh'
+  print -r -- '#!/bin/zsh -f'
   print -r -- "exec ${(q)RUNTIME_DIR}/brewski --askpass-helper \"\$@\""
 } > "$ASKPASS_HELPER" || die "could not write the askpass helper."
 command chmod 700 "$ASKPASS_HELPER" || die "could not prepare the askpass helper."
