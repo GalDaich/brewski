@@ -7,7 +7,7 @@ unsetopt bgnice
 for module in zsh/system zsh/datetime; do
   zmodload "$module" || { print -u2 -r -- "brewski: required module unavailable: $module"; exit 1; }
 done
-VERSION='0.1.1'
+VERSION='0.1.2'
 
 # Homebrew EnvConfig's boolean:true mode (59febf998bd38, env_config.rb):
 # blank strings and exact false tokens are disabled; do not trim other values.
@@ -328,8 +328,8 @@ Update, clean, and verify your Homebrew installation.
 Options:
   --autoremove   Remove formulae installed only as dependencies that Homebrew
                  considers no longer needed. Without this option, brewski only
-                 previews them. Preview is the default because autoremove still
-                 misjudges formulae that are required by casks.
+                 previews them. Preview is the default so you can inspect the
+                 candidates before removal.
 
   --greedy       Also include casks with version :latest. Versioned casks
                  marked auto_updates are upgraded in every mode.

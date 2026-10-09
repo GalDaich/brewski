@@ -4,7 +4,7 @@ A Zsh command-line tool for updating, cleaning, and checking a Homebrew installa
 
 [![CI](https://github.com/GalDaich/brewski/actions/workflows/ci.yml/badge.svg)](https://github.com/GalDaich/brewski/actions/workflows/ci.yml)
 
-**Current version:** `0.1.1`. See [releases](https://github.com/GalDaich/brewski/releases) for source archives and SHA-256 checksums.
+**Current version:** `0.1.2`. See [releases](https://github.com/GalDaich/brewski/releases) for source archives and SHA-256 checksums.
 
 ## What it does
 
@@ -96,7 +96,7 @@ If running directly from the checkout, use `./bin/brewski` instead of `brewski`.
 | `--version` | Show the version without running maintenance. |
 | `-h`, `--help` | Show help without running maintenance. |
 
-Options can be combined. Brewski also respects `HOMEBREW_NO_UPGRADE_QUIT_CASKS` and reflects it in the run banner. `NO_COLOR` disables Brewski's color output.
+Options can be combined. Brewski respects the effective `HOMEBREW_NO_UPGRADE_QUIT_CASKS` value after Homebrew loads `brew.env` and reflects it in the run banner. Empty or whitespace-only values and `false`, `no`, `off`, `nil`, or `0` (case-insensitive) disable the setting; `--no-quit` always enables it. `NO_COLOR` disables Brewski's color output.
 
 ## Passwords and notifications
 
@@ -163,7 +163,7 @@ zsh -n bin/brewski
 python3 -m unittest discover -s tests -v
 ```
 
-The 15 regression tests cover simulated Homebrew operations, option combinations, failure handling, locking, cleanup, self-upgrade recovery, process interruption, and terminal password handling with fake passwords. They do not perform real package upgrades or validate desktop notification display.
+The regression suite covers simulated Homebrew operations, option combinations, effective configuration and Boolean parsing, failure handling, locking, cleanup, self-upgrade recovery, process interruption, and terminal password handling with fake passwords. It does not perform real package upgrades or validate desktop notification display.
 
 The original working script is preserved at the Git tag `baseline-2026-09-19`; `main` includes the reliability fixes. Report problems through [GitHub Issues](https://github.com/GalDaich/brewski/issues), including the Brewski version, macOS/Homebrew versions, command used, and relevant output. Remove credentials or personal details from any output you share.
 

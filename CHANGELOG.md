@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2
+
+- Require the password signal regression test to reach the prompt, deliver the
+  signal, and verify its exact exit status; reject an early helper failure.
+- Accept Homebrew-compatible Boolean values for safety policy settings while
+  preserving cask-list and private password-helper safeguards.
+- Respect effective no-quit configuration, explicit command-line precedence,
+  and configuration changes after the metadata update.
+- Clarify autoremove preview and document the configuration fixture's provenance.
+
 ## 0.1.1
 
 - Stop before maintenance when Homebrew configuration overrides autoremove,
