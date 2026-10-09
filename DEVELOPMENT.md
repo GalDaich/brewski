@@ -14,8 +14,10 @@ python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
-The tests substitute a simulated `brew` executable, use temporary directories,
-and change only the lock-directory assignment in a temporary script copy.
+The tests substitute a simulated `brew` executable and use temporary directories.
+Their baseline script copy changes the lock-directory assignment to isolate user
+state; negative controls also deliberately mutate that temporary copy, including
+an early password-helper return that must fail the signal scenario.
 They never upgrade packages or request actual administrator credentials.
 Python is a test dependency, not a runtime dependency.
 
@@ -48,9 +50,11 @@ it is absent from terminal output, and check echo restoration.
   package/version text is not parsed, so no JSON parser dependency is required.
 - Advisory failures and remaining updates produce a completed-with-warnings
   summary while preserving exit status 0 if required tasks passed.
-- `HOMEBREW_NO_UPGRADE_QUIT_CASKS` is respected and reflected in the banner.
-  `--no-quit` does not promise deferred installation.
-- `--version` reports `0.1.1`. Notifications are described as best-effort.
+- The effective `HOMEBREW_NO_UPGRADE_QUIT_CASKS` value after `brew.env` loading is
+  reflected in the banner and rechecked after the metadata update. Explicit
+  `--no-quit` takes precedence; a later configuration change can otherwise enable
+  or disable the flag. `--no-quit` does not promise deferred installation.
+- `--version` reports `0.1.2`. Notifications are described as best-effort.
 - A private external Homebrew command checks the effective environment after
   system, prefix, and user `brew.env` loading, before metadata update and again
   before upgrades. Conflicts with automatic-removal safeguards, versioned cask
@@ -66,6 +70,18 @@ it is absent from terminal output, and check echo restoration.
 
 The suite validates simulated maintenance and actual PTY behavior. Real Homebrew
 upgrades and desktop notification display are not automated acceptance tests.
+
+### Configuration fixture maintenance
+
+`tests/fixtures/brew-with-config` mirrors `bin/brew`'s
+`export_homebrew_env_file` and configuration-loading sequence at Homebrew revision
+`59febf998bd38fdbbac2f6d2d1e591cfa109a7d6`, with paths redirected to test files.
+When checking a newer Homebrew version, compare protected-variable exclusions,
+quoted exports without shell evaluation, line trimming, system/prefix/user load
+order and system-priority reload, XDG configuration selection, and nested-brew
+PATH restoration. Check Ruby `EnvConfig` Boolean semantics separately from the
+shell loader. These are simulated integration tests, not proof of compatibility
+with future Homebrew releases.
 
 
 ## Releases

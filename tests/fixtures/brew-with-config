@@ -1,6 +1,8 @@
 #!/bin/bash
 # Fake brew: Homebrew bin/brew's quoted export loader and precedence, with
 # system/prefix paths redirected to temporary test files. Never calls real brew.
+# Mirrors bin/brew export_homebrew_env_file and the loading sequence at Homebrew
+# 59febf998bd38fdbbac2f6d2d1e591cfa109a7d6. See DEVELOPMENT.md's maintenance checklist.
 export_homebrew_env_file() {
   local env_file="${1}" line
   [[ -r "${env_file}" ]] || return 0
