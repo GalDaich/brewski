@@ -11,6 +11,7 @@ from pathlib import Path
 import pty
 import select
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -622,22 +623,34 @@ class BrewskiTests(unittest.TestCase):
         canary = self.tmp/'last-sudo-notify'
         canary_bytes = canary.read_bytes()
         shared = Path('/tmp/last-sudo-notify')
-        shared_before = None
-        if shared.is_symlink():
-            shared_before = ('link', os.readlink(shared))
-        elif shared.is_file():
-            shared_before = ('file', shared.read_bytes())
-        elif shared.exists():
-            shared_before = ('other', None)
+        try:
+            shared_before = os.lstat(shared)
+        except FileNotFoundError:
+            shared_before = None
 
-        def restore_shared():
-            if shared.exists() or shared.is_symlink():
-                shared.unlink()
-            if shared_before and shared_before[0] == 'link':
-                shared.symlink_to(shared_before[1])
-            elif shared_before and shared_before[0] == 'file':
-                shared.write_bytes(shared_before[1])
-        self.addCleanup(restore_shared)
+        def node_meta(st):
+            return (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
+                    st.st_gid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+        def remove_errant_shared():
+            # A node that was already there is left alone, including on failure.
+            if shared_before is not None:
+                return
+            try:
+                os.lstat(shared)
+            except FileNotFoundError:
+                return
+            os.unlink(shared)
+        self.addCleanup(remove_errant_shared)
+
+        if shared_before is not None and stat.S_ISLNK(shared_before.st_mode):
+            shared_target = os.readlink(shared)
+        else:
+            shared_target = None
+        if shared_before is not None and stat.S_ISREG(shared_before.st_mode):
+            shared_bytes = shared.read_bytes()
+        else:
+            shared_bytes = None
 
         code, output, secret = self.password(maintenance=True, mode='askpass-env')
         self.assertEqual(code, 0, output)
@@ -657,12 +670,14 @@ class BrewskiTests(unittest.TestCase):
         self.assertEqual(runtime.parent, self.tmp)
         self.assertEqual(canary.read_bytes(), canary_bytes)
         if shared_before is None:
-            self.assertFalse(shared.exists() or shared.is_symlink())
-        elif shared_before[0] == 'link':
-            self.assertTrue(shared.is_symlink())
-            self.assertEqual(os.readlink(shared), shared_before[1])
-        elif shared_before[0] == 'file':
-            self.assertEqual(shared.read_bytes(), shared_before[1])
+            with self.assertRaises(FileNotFoundError):
+                os.lstat(shared)
+        else:
+            self.assertEqual(node_meta(os.lstat(shared)), node_meta(shared_before))
+            if shared_target is not None:
+                self.assertEqual(os.readlink(shared), shared_target)
+            if shared_bytes is not None:
+                self.assertEqual(shared.read_bytes(), shared_bytes)
         self.assert_clean()
 
     def test_askpass_without_runtime_dir_leaves_tmpdir_symlink_and_fifo(self):
@@ -698,18 +713,31 @@ class BrewskiTests(unittest.TestCase):
         target = self.root/'stamp-target'
         target.write_text('do-not-clobber\n')
         stamp = runtime/'last-sudo-notify'
-        for kind in ('symlink', 'fifo'):
+        for kind in ('symlink', 'fifo', 'directory-symlink'):
             with self.subTest(kind=kind):
                 if stamp.exists() or stamp.is_symlink():
                     stamp.unlink()
+                linked = None
                 if kind == 'symlink':
                     stamp.symlink_to(target)
-                else:
+                elif kind == 'fifo':
                     os.mkfifo(stamp)
+                else:
+                    linked = self.root/'stamp-dir'
+                    linked.mkdir()
+                    (linked/'canary').write_text('do-not-clobber\n')
+                    stamp.symlink_to(linked)
+                linked_before = sorted(os.listdir(linked)) if linked else None
+                canary_stat = os.lstat(linked/'canary') if linked else None
                 code, output, secret = self.password()
                 self.assertEqual(code, 0, output)
                 self.assertEqual(secret, b'FAKE-test-password\n')
-                self.assertEqual(target.read_text(), 'do-not-clobber\n')
+                if linked is not None:
+                    self.assertEqual((linked/'canary').read_text(), 'do-not-clobber\n')
+                    self.assertEqual(os.lstat(linked/'canary').st_ino, canary_stat.st_ino)
+                    self.assertEqual(sorted(os.listdir(linked)), linked_before)
+                else:
+                    self.assertEqual(target.read_text(), 'do-not-clobber\n')
                 self.assertFalse(stamp.is_symlink())
                 self.assertTrue(stamp.is_file())
                 self.assertFalse(stamp.is_fifo())

@@ -286,16 +286,27 @@ askpass_context() {
   print -r -- Homebrew
 }
 
+# mv -f follows a symlink to a directory and writes the new file inside it.
+replace_file() {
+  local src="$1" dest="$2"
+  if [[ -L "$dest" ]]; then
+    command rm -f -- "$dest" || return 1
+  elif [[ -d "$dest" ]]; then
+    return 1
+  fi
+  command mv -f -- "$src" "$dest"
+}
+
 askpass_record_stamp() {
-  local now="$1" stamp_tmp
-  # mktemp + mv replaces a symlink or FIFO without opening it.
+  local now="$1" stamp_tmp dest
+  dest="${BREWSKI_RUNTIME_DIR}/last-sudo-notify"
   stamp_tmp="$(command mktemp "${BREWSKI_RUNTIME_DIR}/last-sudo-notify.XXXXXX" 2>/dev/null)" \
     || return 0
   if ! print -r -- "$now" > "$stamp_tmp" 2>/dev/null; then
     command rm -f -- "$stamp_tmp"
     return 0
   fi
-  command mv -f -- "$stamp_tmp" "${BREWSKI_RUNTIME_DIR}/last-sudo-notify" 2>/dev/null \
+  replace_file "$stamp_tmp" "$dest" 2>/dev/null \
     || command rm -f -- "$stamp_tmp"
 }
 
@@ -470,7 +481,7 @@ run_task() {
     command rm -f -- "$task_tmp"
     die "could not record the active task."
   fi
-  if ! command mv -f -- "$task_tmp" "${RUNTIME_DIR}/task"; then
+  if ! replace_file "$task_tmp" "${RUNTIME_DIR}/task"; then
     command rm -f -- "$task_tmp"
     die "could not record the active task."
   fi
