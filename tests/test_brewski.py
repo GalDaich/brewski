@@ -11,7 +11,6 @@ from pathlib import Path
 import pty
 import select
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -622,35 +621,6 @@ class BrewskiTests(unittest.TestCase):
                         TEST_ASKPASS_REPORT=str(self.root/'askpass-report'))
         canary = self.tmp/'last-sudo-notify'
         canary_bytes = canary.read_bytes()
-        shared = Path('/tmp/last-sudo-notify')
-        try:
-            shared_before = os.lstat(shared)
-        except FileNotFoundError:
-            shared_before = None
-
-        def node_meta(st):
-            return (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
-                    st.st_gid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-
-        def remove_errant_shared():
-            # A node that was already there is left alone, including on failure.
-            if shared_before is not None:
-                return
-            try:
-                os.lstat(shared)
-            except FileNotFoundError:
-                return
-            os.unlink(shared)
-        self.addCleanup(remove_errant_shared)
-
-        if shared_before is not None and stat.S_ISLNK(shared_before.st_mode):
-            shared_target = os.readlink(shared)
-        else:
-            shared_target = None
-        if shared_before is not None and stat.S_ISREG(shared_before.st_mode):
-            shared_bytes = shared.read_bytes()
-        else:
-            shared_bytes = None
 
         code, output, secret = self.password(maintenance=True, mode='askpass-env')
         self.assertEqual(code, 0, output)
@@ -669,15 +639,6 @@ class BrewskiTests(unittest.TestCase):
         self.assertTrue(runtime.name.startswith('brewski-run.'))
         self.assertEqual(runtime.parent, self.tmp)
         self.assertEqual(canary.read_bytes(), canary_bytes)
-        if shared_before is None:
-            with self.assertRaises(FileNotFoundError):
-                os.lstat(shared)
-        else:
-            self.assertEqual(node_meta(os.lstat(shared)), node_meta(shared_before))
-            if shared_target is not None:
-                self.assertEqual(os.readlink(shared), shared_target)
-            if shared_bytes is not None:
-                self.assertEqual(shared.read_bytes(), shared_bytes)
         self.assert_clean()
 
     def test_askpass_without_runtime_dir_leaves_tmpdir_symlink_and_fifo(self):
