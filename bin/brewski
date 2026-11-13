@@ -262,19 +262,74 @@ read_tty_password() {
   print -r -- "$pw"
 }
 
+askpass_runtime_ready() {
+  [[ -n "${BREWSKI_RUNTIME_DIR:-}" && ! -L "$BREWSKI_RUNTIME_DIR" \
+     && -d "$BREWSKI_RUNTIME_DIR" && -O "$BREWSKI_RUNTIME_DIR" ]]
+}
+
+askpass_context() {
+  local task_file label
+  if [[ -n "${BREWSKI_TASK:-}" ]]; then
+    print -r -- "$BREWSKI_TASK"
+    return 0
+  fi
+  if askpass_runtime_ready; then
+    task_file="${BREWSKI_RUNTIME_DIR}/task"
+    if [[ ! -L "$task_file" && -f "$task_file" ]]; then
+      IFS= read -r label < "$task_file"
+      if [[ -n "$label" ]]; then
+        print -r -- "$label"
+        return 0
+      fi
+    fi
+  fi
+  print -r -- Homebrew
+}
+
+# mv -f follows a symlink to a directory and writes the new file inside it.
+replace_file() {
+  local src="$1" dest="$2"
+  if [[ -L "$dest" ]]; then
+    command rm -f -- "$dest" || return 1
+  elif [[ -d "$dest" ]]; then
+    return 1
+  fi
+  command mv -f -- "$src" "$dest"
+}
+
+askpass_record_stamp() {
+  local now="$1" stamp_tmp dest
+  dest="${BREWSKI_RUNTIME_DIR}/last-sudo-notify"
+  stamp_tmp="$(command mktemp "${BREWSKI_RUNTIME_DIR}/last-sudo-notify.XXXXXX" 2>/dev/null)" \
+    || return 0
+  if ! print -r -- "$now" > "$stamp_tmp" 2>/dev/null; then
+    command rm -f -- "$stamp_tmp"
+    return 0
+  fi
+  replace_file "$stamp_tmp" "$dest" 2>/dev/null \
+    || command rm -f -- "$stamp_tmp"
+}
+
 askpass_main() {
   local prompt="${1:-Password:}"
-  local context="${BREWSKI_TASK:-Homebrew}"
-  local stamp="${BREWSKI_RUNTIME_DIR:-${TMPDIR:-/tmp}}/last-sudo-notify"
-  local now=$EPOCHSECONDS last=0
+  local context now=$EPOCHSECONDS last=0 stamp
+  context="$(askpass_context)"
 
   # sudo re-invokes the helper on a mistyped password; don't stack alerts.
-  [[ -r "$stamp" ]] && IFS= read -r last < "$stamp" 2>/dev/null
+  # No shared /tmp stamp: brew's env -i drops both BREWSKI_RUNTIME_DIR and TMPDIR.
+  if askpass_runtime_ready; then
+    stamp="${BREWSKI_RUNTIME_DIR}/last-sudo-notify"
+    if [[ ! -L "$stamp" && -f "$stamp" ]]; then
+      IFS= read -r last < "$stamp" 2>/dev/null
+    fi
+  fi
   [[ "$last" == <-> ]] || last=0
   if (( now - last > 30 )); then
     notify "🔐 brewski needs your password" \
            "${context}: an installer is requesting administrator access."
-    print -r -- "$now" > "$stamp" 2>/dev/null
+    if askpass_runtime_ready; then
+      askpass_record_stamp "$now"
+    fi
   fi
 
   # Probe by opening, not with -r/-w: see notify_tty. Getting this wrong makes
@@ -419,6 +474,17 @@ run_task() {
   show_command "$@"
 
   local start=$EPOCHREALTIME
+  local task_tmp
+  task_tmp="$(command mktemp "${RUNTIME_DIR}/task.XXXXXX")" \
+    || die "could not record the active task."
+  if ! print -r -- "$label" > "$task_tmp"; then
+    command rm -f -- "$task_tmp"
+    die "could not record the active task."
+  fi
+  if ! replace_file "$task_tmp" "${RUNTIME_DIR}/task"; then
+    command rm -f -- "$task_tmp"
+    die "could not record the active task."
+  fi
 
   # Run in the background and wait: zsh defers trap handlers until a foreground
   # child exits, which would make SIGTERM/SIGHUP arrive only after a long
@@ -685,6 +751,13 @@ command chmod 700 "$RUNTIME_DIR/brewski" || die "could not secure the password h
 ASKPASS_HELPER="${RUNTIME_DIR}/askpass"
 {
   print -r -- '#!/bin/zsh -f'
+  print -r -- "export BREWSKI_RUNTIME_DIR=${(q)RUNTIME_DIR}"
+  [[ -n "${TMUX:-}" ]] && print -r -- "export TMUX=${(q)TMUX}"
+  [[ -n "${TERM_PROGRAM:-}" ]] && print -r -- "export TERM_PROGRAM=${(q)TERM_PROGRAM}"
+  [[ -n "${KITTY_WINDOW_ID:-}" ]] && print -r -- "export KITTY_WINDOW_ID=${(q)KITTY_WINDOW_ID}"
+  [[ -n "${WEZTERM_PANE:-}" ]] && print -r -- "export WEZTERM_PANE=${(q)WEZTERM_PANE}"
+  [[ -n "${GHOSTTY_RESOURCES_DIR:-}" ]] && print -r -- "export GHOSTTY_RESOURCES_DIR=${(q)GHOSTTY_RESOURCES_DIR}"
+  [[ -n "${__CFBundleIdentifier:-}" ]] && print -r -- "export __CFBundleIdentifier=${(q)__CFBundleIdentifier}"
   print -r -- "exec ${(q)RUNTIME_DIR}/brewski --askpass-helper \"\$@\""
 } > "$ASKPASS_HELPER" || die "could not write the askpass helper."
 command chmod 700 "$ASKPASS_HELPER" || die "could not prepare the askpass helper."
