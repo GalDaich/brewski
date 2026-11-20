@@ -73,6 +73,27 @@ if mode == 'askpass' and args[:2] == ['upgrade', '--cask']:
     result = subprocess.run([os.environ['SUDO_ASKPASS'], 'Password:'], capture_output=True)
     Path(os.environ['TEST_PASSWORD_RESPONSE']).write_bytes(result.stdout)
     sys.exit(result.returncode)
+if mode == 'askpass-env' and args[:2] == ['upgrade', '--cask']:
+    # Homebrew bin/brew's env -i whitelist at 59febf998bd38. Empty values are dropped.
+    keep = {'HOME', 'SHELL', 'PATH', 'TERM', 'TERMINFO', 'TERMINFO_DIRS', 'COLUMNS',
+            'DISPLAY', 'LOGNAME', 'USER', 'CI', 'SSH_AUTH_SOCK', 'SUDO_ASKPASS',
+            'http_proxy', 'https_proxy', 'ftp_proxy', 'no_proxy', 'all_proxy',
+            'HTTPS_PROXY', 'FTP_PROXY', 'ALL_PROXY'}
+    filtered = {key: value for key, value in os.environ.items()
+                if value and (key in keep or key.startswith('HOMEBREW_'))}
+    filtered['PATH'] = '/usr/bin:/bin:/usr/sbin:/sbin'
+    result = subprocess.run([os.environ['SUDO_ASKPASS'], 'Password:'],
+                            capture_output=True, env=filtered)
+    runtime = os.environ.get('BREWSKI_RUNTIME_DIR', '')
+    def regular(name):
+        path = Path(runtime, name) if runtime else None
+        if path and path.is_file() and not path.is_symlink():
+            return path.read_text()
+        return None
+    Path(os.environ['TEST_ASKPASS_REPORT']).write_text(json.dumps({
+        'runtime': runtime, 'task': regular('task'), 'stamp': regular('last-sudo-notify')}))
+    Path(os.environ['TEST_PASSWORD_RESPONSE']).write_bytes(result.stdout)
+    sys.exit(result.returncode)
 if mode == 'outdated' and args[0] == 'outdated':
     print('example (1.0) < 2.0 [pinned]')
 if ' '.join(args) == os.getenv('TEST_FAIL'):
@@ -495,14 +516,14 @@ class BrewskiTests(unittest.TestCase):
                 else: self.fail('descendant survived cancellation')
                 self.assert_clean()
 
-    def password(self, fail='', sig=None, maintenance=False):
+    def password(self, fail='', sig=None, maintenance=False, mode='askpass'):
         if fail:
             self.stub('stty', '#!/bin/sh\ncase "$1" in ' + fail + ') exit 1;; esac\nexec /bin/stty "$@"\n')
         # A separate stdout pipe verifies passwords never mix with prompts.
         # Maintenance captures the generated helper's response in the fake brew.
         response = self.root/'password-response'
         if maintenance:
-            self.env.update(TEST_MODE='askpass', TEST_PASSWORD_RESPONSE=str(response))
+            self.env.update(TEST_MODE=mode, TEST_PASSWORD_RESPONSE=str(response))
         read_fd, write_fd = os.pipe()
         pid, tty = pty.fork()
         if pid == 0:
@@ -592,6 +613,97 @@ class BrewskiTests(unittest.TestCase):
         self.assertEqual(secret, b'FAKE-test-password\n')
         self.assertIn(['cleanup'], [call['args'] for call in self.calls()])
         self.assert_clean()
+
+    def test_maintenance_askpass_keeps_context_under_brew_env_filter(self):
+        # Whitelist strips BREWSKI_*, TMPDIR, TMUX, and the terminal variables.
+        self.env.update(TMUX='/tmp/tmux 1000/default,1,0', TERM_PROGRAM='ghostty',
+                        __CFBundleIdentifier='com.apple.Terminal',
+                        TEST_ASKPASS_REPORT=str(self.root/'askpass-report'))
+        canary = self.tmp/'last-sudo-notify'
+        canary_bytes = canary.read_bytes()
+
+        code, output, secret = self.password(maintenance=True, mode='askpass-env')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(secret, b'FAKE-test-password\n')
+        title = '🔐 brewski needs your password'
+        body = 'Cask upgrades: an installer is requesting administrator access.'
+        payload = f'\x1b]777;notify;{title};{body}\x07'.encode()
+        wrapped = b'\x1bPtmux;' + payload.replace(b'\x1b', b'\x1b\x1b') + b'\x1b\\'
+        self.assertIn(wrapped, output)
+        self.assertIn(b'administrator access required for Cask upgrades.', output)
+        report = json.loads((self.root/'askpass-report').read_text())
+        self.assertEqual(report['task'], 'Cask upgrades\n')
+        self.assertRegex(report['stamp'], r'\A[0-9]+\n\Z')
+        self.assertLess(abs(int(report['stamp']) - time.time()), 60)
+        runtime = Path(report['runtime'])
+        self.assertTrue(runtime.name.startswith('brewski-run.'))
+        self.assertEqual(runtime.parent, self.tmp)
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assert_clean()
+
+    def test_askpass_without_runtime_dir_leaves_tmpdir_symlink_and_fifo(self):
+        self.env.pop('BREWSKI_RUNTIME_DIR', None)
+        target = self.root/'stamp-target'
+        target.write_text('do-not-clobber\n')
+        stamp = self.tmp/'last-sudo-notify'
+        for kind in ('symlink', 'fifo'):
+            with self.subTest(kind=kind):
+                if stamp.exists() or stamp.is_symlink():
+                    stamp.unlink()
+                if kind == 'symlink':
+                    stamp.symlink_to(target)
+                else:
+                    os.mkfifo(stamp)
+                code, output, secret = self.password()
+                self.assertEqual(code, 0, output)
+                self.assertEqual(secret, b'FAKE-test-password\n')
+                self.assertIn(b'administrator access required for Homebrew.', output)
+                self.assertEqual(target.read_text(), 'do-not-clobber\n')
+                if kind == 'symlink':
+                    self.assertTrue(stamp.is_symlink())
+                    self.assertEqual(os.readlink(stamp), str(target))
+                else:
+                    self.assertTrue(stamp.is_fifo())
+
+    def test_askpass_runtime_stamp_replaces_symlink_and_fifo(self):
+        runtime = self.root/'owned-runtime'
+        runtime.mkdir(mode=0o700)
+        self.env['BREWSKI_RUNTIME_DIR'] = str(runtime)
+        canary = self.tmp/'last-sudo-notify'
+        canary_bytes = canary.read_bytes()
+        target = self.root/'stamp-target'
+        target.write_text('do-not-clobber\n')
+        stamp = runtime/'last-sudo-notify'
+        for kind in ('symlink', 'fifo', 'directory-symlink'):
+            with self.subTest(kind=kind):
+                if stamp.exists() or stamp.is_symlink():
+                    stamp.unlink()
+                linked = None
+                if kind == 'symlink':
+                    stamp.symlink_to(target)
+                elif kind == 'fifo':
+                    os.mkfifo(stamp)
+                else:
+                    linked = self.root/'stamp-dir'
+                    linked.mkdir()
+                    (linked/'canary').write_text('do-not-clobber\n')
+                    stamp.symlink_to(linked)
+                linked_before = sorted(os.listdir(linked)) if linked else None
+                canary_stat = os.lstat(linked/'canary') if linked else None
+                code, output, secret = self.password()
+                self.assertEqual(code, 0, output)
+                self.assertEqual(secret, b'FAKE-test-password\n')
+                if linked is not None:
+                    self.assertEqual((linked/'canary').read_text(), 'do-not-clobber\n')
+                    self.assertEqual(os.lstat(linked/'canary').st_ino, canary_stat.st_ino)
+                    self.assertEqual(sorted(os.listdir(linked)), linked_before)
+                else:
+                    self.assertEqual(target.read_text(), 'do-not-clobber\n')
+                self.assertFalse(stamp.is_symlink())
+                self.assertTrue(stamp.is_file())
+                self.assertFalse(stamp.is_fifo())
+                self.assertRegex(stamp.read_text(), r'\A[0-9]+\n\Z')
+                self.assertEqual(canary.read_bytes(), canary_bytes)
 
     def test_password_stty_save_failure(self):
         code, output, secret = self.password(fail='-g')
