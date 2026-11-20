@@ -54,7 +54,7 @@ it is absent from terminal output, and check echo restoration.
   reflected in the banner and rechecked after the metadata update. Explicit
   `--no-quit` takes precedence; a later configuration change can otherwise enable
   or disable the flag. `--no-quit` does not promise deferred installation.
-- `--version` reports `0.1.2`. Notifications are described as best-effort.
+- `--version` reports `0.1.3`. Notifications are described as best-effort.
 - A private external Homebrew command checks the effective environment after
   system, prefix, and user `brew.env` loading, before metadata update and again
   before upgrades. Conflicts with automatic-removal safeguards, versioned cask

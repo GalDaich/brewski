@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+
+- Keep the task name and the desktop notification on a password prompt when
+  Homebrew clears the environment.
+- Write the password-request stamp in the private run directory.
+- Stop using the shared file `/tmp/last-sudo-notify`.
+
 ## 0.1.2
 
 - Require the password signal regression test to reach the prompt, deliver the
